@@ -1,0 +1,12 @@
+#!/bin/sh
+
+BIN_DIR=/exec/apps/bin/evr/daemon_lock
+
+WISH=/exec/apps/bin/ctk/start_wish_3.6
+CODE="$BIN_DIR/`basename $0`.tcl $1 $2 $3"
+
+
+
+export BIN_DIR
+
+exec $WISH $CODE

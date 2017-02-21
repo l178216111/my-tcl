@@ -1,0 +1,400 @@
+#!/usr/local/bin/wctksh_3.2
+###############################################################
+# Status Message
+###############################################################
+proc StatusMsg { station message } {
+        global pause Info
+#       puts $mode(abort)
+#       puts $message
+        if { [ string equal $message "Pause" ]  } {
+                set pause 1
+        }
+        if { [ string equal $message "Testing" ] } {
+                set pause 0
+        }
+#       puts $pause
+}
+###############################################################
+# This procedure gets called when integrator issues
+###############################################################
+proc InfoMessage { station message } {
+        global Info
+#       WriteFile $Info(LogFile) "InfoMessage:$message"
+        if [regexp {^Starting wafer session ([^ ]+)} $message match wafer] {
+                set Info(WaferID) $wafer
+#		puts $Info(WaferID)
+        }
+        set CURR_TIME [ clock format [ clock seconds ] -format "%Y%m%d%H%M%S" ]
+
+        if [regexp {^Starting lot ([^ ]+)} $message match lot] {
+                set Info(LotID) $lot
+                if { [ regexp -nocase {^(GG|KK|C).*} $Info(LotID) match str ]  } {
+                        set Info(type) NOPRO
+                } else {
+                        set Info(type) PRO
+                }
+        }
+
+        if [regexp {^Reading setup ([^ ]+)} $message match setup] {
+                set Info(Device) $setup
+        }
+}
+###############################################################
+# At the start of each lot DO:
+#
+###############################################################
+proc StartOfLot {station} {
+        global Info BinDir conf
+		if  { [ string compare $Info(type) PRO ]==0 } {
+        		if { [ string compare $conf(ocr) 1 ]==0 } {
+				set cmd "$BinDir/etc/promis_list $Info(LotID)"
+				if { [ catch { set result [ eval exec "$cmd " ] } err ] } { 
+					tk_dialog .shresult " Error " $err warning 0 "Ok"
+				} else { 
+					set Info(promis_list) [ split $result , ]
+				}
+			}
+	}
+}
+proc StartOfWafer { station } {
+	global Info window BinDir conf
+#	puts "wafer"
+	if  { [ string compare $Info(type) PRO ]==0 } {
+        	if { [ string compare $conf(ocr) 1 ]==0 } {
+			if { [ regexp {1-(\d+)} $Info(WaferID) match wafer ] } {
+				foreach id { $Info(promis_list) } {
+					if { [string compare $id $wafer ]==0 } {
+						return 
+					}
+				}
+				evr send pause 0
+				set err "waferid:$Info(WaferID) doesn't match promis list:$Info(promis_list)"
+				WriteFile $Info(LogFile) $err
+				warning $window(warning) "$BinDir/etc/warning_promis.gif"
+			} else {
+				set err "Can't recognize waferid:$Info(WaferID)"
+		 		tk_dialog .shresult " Error " $err warning 0 "Ok"
+				WriteFile $Info(LogFile) $err
+			}
+		}
+	}
+}
+############################################################
+#MoveCuresor
+###########################################################
+proc MoveCursor {station site x y}  {
+        global Info window pause
+        if {$site == 0} {
+		 if { [winfo exists $window(warning)] != 0 } { 
+	#		puts $pause
+                 	if { [string compare $pause 0 ] ==0 } {
+                      		evr send pause $station
+                	}
+			wm deiconify $window(warning)
+		 }
+        }
+}
+proc cassetteinfo { station cassStat } {
+	global Info conf
+	puts "cassetteinfo"
+#	if {[ string compare $conf(ocr) 1 ]==0 } {
+		puts $cassStat	
+#	}
+}
+proc waferpassinfo { station block } {
+	global conf Info BinDir pause window
+#	puts "waferinfo"
+	if  { [ string compare $Info(type) PRO ]==0 } {
+	if { [ string compare $conf(ocr) 1 ]==0 } {
+		set tmpfile "/tmp/smwaferpassinfo\.$Info(LotID)"
+		if { [catch { set fh [open $tmpfile "w"]} err ] } {
+			WriteFile $Info(LogFile) "waferpassinfo:Error creating temp file $tmpfile : $open_err"
+			 tk_dialog .shresult " Error " $err warning 0 "Ok"
+                	return
+		}
+		puts $fh $block
+        	close $fh
+		if { [catch { set fh [open $tmpfile "r"] } err ] } {
+                	WriteFile $Info(LogFile) "waferpassinfo: Error reading temp file $tmpfile : $open_err"
+			tk_dialog .shresult " Error " $err warning 0 "Ok"
+                	return
+        	}
+        	inf infcmd
+        	infcmd load $fh
+        	close $fh		
+		if  {[ file exists $tmpfile ] } {
+			file delete $tmpfile
+		}	
+        	if { [set wpi [infcmd blocks -noerror smwaferpassinfo]] == {}} {
+                	set Info(OCR)  {}
+        	} else {
+			set Info(OCR) [$wpi data -noerror OCR]
+		}
+		set cmd "$BinDir/etc/ocr_compare.pl $Info(Device) $Info(LotID) r_$Info(WaferID)"
+		if { [catch { set match [ eval "exec $cmd" ] } errmsg]} {
+                        set err "OCR compare Error: $errmsg"
+			tk_dialog .shresult " Error " $err warning 0 "Ok"
+                        WriteFile $Info(LogFile) $err
+                        return
+		}
+		if  { [ string compare $match $Info(OCR) ]!=0 } { 
+			WriteFile $Info(LogFile) "OCR doesn't match OCR_rd:$Info(OCR) OCR_cal:$match"
+        	        evr send pause 0
+                        warning $window(warning) "$BinDir/etc/warnning.gif" 
+		}
+	#	puts "OCR:$Info(OCR)"
+		set filename [file join $Info(floor) $Info(Device) $Info(LotID) .ocr r_$Info(WaferID)]
+		set cmd "$conf(OCR_WRITE) $Info(Device) $Info(LotID) r_$Info(WaferID)  $Info(OCR)"
+		if { [catch { eval "exec $cmd"} errmsg]} {
+                	set err "OCR Error: $errmsg"
+			tk_dialog .shresult " Error " $err warning 0 "Ok"
+			WriteFile $Info(LogFile) $err
+                	return
+        	}
+        	if {! [file readable $filename]} {
+                	set err "OCR Error: missing file: $filename"
+			tk_dialog .shresult " Error " $err warning 0 "Ok"
+			WriteFile $Info(LogFile) $err
+                	return
+        	}
+        	if { [catch {set fd [open $filename r]} err]} {
+                	set err "OCR Error: could not open OCR file: $err"
+			tk_dialog .shresult " Error " $err warning 0 "Ok"
+			WriteFile $Info(LogFile) $err
+                	return
+        	}
+        	set ocrstr [gets $fd]
+        	close $fd
+        	if {$ocrstr != $Info(OCR)} {
+                	set err "OCR Error: bad file content, $ocrstr != $evr_data($station,ocr), in $filename"
+                	WriteFile $Info(LogFile) $err
+			tk_dialog .shresult " Error " $err warning 0 "Ok"
+                	return
+        	}
+
+		WriteFile $Info(LogFile) "waferpassinfo:OCR:$Info(OCR) write done"		
+	}
+	}
+}
+
+proc SetupName { station floordir setupfile } {
+	global conf Info BinDir 
+#	puts "setup"
+	set Path [ string trimright $floordir 1 ]
+#	set cmd "cat $Path\/$setupfile | tr '\\' '\012' | grep IDEN | sed 's/.*://'"
+	set cmd "$BinDir/etc/getVal $Path/$setupfile IDEN"
+	if { [catch { set conf(ocr) [eval exec $cmd]} err] } {
+		WriteFile $Info(LogFile) "SetupName:read setupfile ERROR. ERROR MSG: $err"	
+		return
+	} 
+	set conf(ocr) [ lindex [ split $conf(ocr) \n ] 0 ] 
+}
+###############################################################
+#
+# WriteFile
+#
+###############################################################
+proc WriteFile { filename text } {
+        global Info
+        set time_stamp [clock format [clock seconds] -format "%D %T"]
+        if { [ catch { set fp [open $filename "a+"] } err ] } { 
+		 tk_dialog .shresult " Error " $err warning 0 "Ok"
+	} else {
+        	puts $fp "$text Host:$Info(HOST),Part:$Info(Device) Lot:$Info(LotID) Pass:$Info(PassNumber) Wafer: $Info(WaferID)  <= @ $time_stamp"
+        	close $fp
+	}
+}
+proc reset { } {
+	global Info window pause
+        set Info(Device) N/A
+        set Info(LotID) N/A
+        set Info(PassNumber) N/A
+        set Info(WaferID) N/A
+	set Info(OCR) N/A
+	set window(warning) .win_warning
+#falg 1:pause 0:running
+        set pause 1
+	
+}
+############################
+#warning window
+############################
+proc warning { warning im } {
+        global Info  window BinDir  Confirmed pause
+        set sizes [wm maxsize .]
+        set x [expr {[lindex $sizes 0]/2 - 450}]
+        set y [expr {[lindex $sizes 1]/2 - 135}]
+        set window(warning) $warning
+        if [winfo exists $warning] return
+        wm withdraw . 
+        wm geometry . {}
+        toplevel $warning
+        wm geometry $warning "800x200+${x}+${y}"
+        wm protocol $warning WM_DELETE_WINDOW { destroy $window(warning) }
+        wm title $warning "TJN-FM OCR Warnning"
+        wm iconname $warning Dialog
+        wm deiconify $warning 
+        wm resizable $warning false false
+        frame $warning.row
+        set img [image create photo -file $im]
+        label $warning.row.l -image $img 
+        pack  $warning.row.l -side left -padx 10 -pady 8
+	frame $warning.row2 
+	label $warning.row2.ocr -text OCR:$Info(OCR)
+	label $warning.row2.device -text DEVICE:$Info(Device)
+	label $warning.row2.lot -text LOT:$Info(LotID)
+	label $warning.row2.wafer -text WaferID:$Info(WaferID)
+	pack $warning.row2.ocr  $warning.row2.device  $warning.row2.lot $warning.row2.wafer -side left  -padx 10 -pady 8
+        frame  $warning.row1
+        button $warning.row1.b1 -text "Abort Lot" -command {
+		warning_command abortlot
+        }
+        button $warning.row1.b2 -text "Contiune Lot" -command {
+		warning_command start
+        }
+        pack $warning.row1.b1 $warning.row1.b2 -side left  -padx 10 -pady 8
+        pack $warning.row $warning.row2 $warning.row1 -side top
+        tkwait visibility $warning
+ 
+}
+##################################################
+##Login
+################################################
+proc Login_Screen {screen} {
+        global window password name Confirmed BinDir
+        set window(login) $screen
+        if [winfo exists $screen] return
+
+#       wm withdraw .
+#       wm geometry . {}
+
+        toplevel $screen
+        wm geometry $screen "-300-400"
+        wm deiconify $screen
+        wm resizable $screen false false
+        wm protocol $screen WM_DELETE_WINDOW { destroy $window(login) }
+        wm title $screen "TJN-FM User Authentication Screen"
+
+        tkwait visibility $screen
+        focus -force $screen
+        #grab set -global $screen
+
+        frame $screen.row0
+        label $screen.row0.l -text " Plese Enter Your OneIT Password "
+        pack  $screen.row0.l -side right -padx 10 -pady 8
+
+        frame $screen.rows
+        label $screen.rows.l0 -text "Login:" -anchor e
+        entry $screen.rows.e0 -textvariable name -width 15
+        grid  $screen.rows.l0 $screen.rows.e0 -padx 6 -pady 4
+
+        label $screen.rows.l1 -text "Password:" -anchor e
+        entry $screen.rows.e1 -textvariable password -width 15 -show *
+        grid  $screen.rows.l1 $screen.rows.e1 -padx 6 -pady 4
+
+        frame  $screen.row3
+        button $screen.row3.b1 -text "Cancel" -command {
+              set Confirmed cancel
+              destroy $window(login)
+              set name ""
+              set password
+	}
+        button $screen.row3.b2 -text "Confirm" -command {
+		Show_Result $window(login)
+        }
+        pack $screen.row3.b2 $screen.row3.b1 -side left -expand yes -fill both -padx 10 -pady 8
+
+        focus $screen.rows.e0
+
+        bind $screen.rows.e0 <Return> \
+        {
+                focus $window(login).rows.e1
+        }
+
+        bind $screen.rows.e1 <Return> \
+        {
+#               $window(login).row3.b2 configure -state active
+#               focus $window(login).row3.b2
+                $window(login).row3.b2 invoke
+        }
+
+        pack $screen.row0 $screen.rows $screen.row3 -side top
+}
+proc Show_Result {screen } {
+	global Info  name password Confirmed BinDir
+        set ldap "$BinDir/etc/login"
+        set cmd "$ldap $name $password"
+        if { [catch { set result [ eval exec $cmd ] } err] } {
+		tk_dialog .shresult " Error " $err warning 0 "Ok"
+        } else {
+		if { [string compare $result 1 ]==0 } {
+	        	if { [winfo exists $screen] != 0 } {
+                                        destroy $screen
+                        }
+                        set Confirmed $name
+                        set name ""
+                        set password ""
+		} else { 
+                        set msg " Invalid login or password! \n\n Try Again? "
+                        set resp [ tk_dialog .shresult " Error " $msg warning 0 "Yes" "No" ]
+                        set name ""
+                        set password ""
+                        if { $resp == 0 } {
+                        } else {
+                                set Confirmed cancel
+				destroy $screen
+                        }
+
+		}
+        }
+}
+###############################
+#warning button
+###############################
+proc warning_command { opt } {
+        global window Info Confirmed pause
+	Login_Screen .login	
+	vwait Confirmed
+#	puts $Confirmed
+        if { [string compare $Confirmed "fail"] !=0 && [string compare $Confirmed "cancel"] !=0 } {
+                 if { [winfo exists $window(warning)] != 0 } {
+                             destroy $window(warning)
+                 }
+                 WriteFile $Info(LogFile) "$Confirmed $opt"
+                 if { [string compare $pause 1 ] !=0 } {
+                             vwait pause
+                 }
+		 evr send $opt 0
+		 if { [string compare $opt abortlot ]==0 } {
+			     evr send start 0
+		 }
+        }
+}
+evr connect localhost
+evr bind infomessage InfoMessage
+evr bind cassetteinfo cassetteinfo
+evr bind startoflot StartOfLot
+evr bind statusmessage StatusMsg
+evr bind setupname SetupName
+evr bind movecursor MoveCursor
+evr bind waferpassinfo   waferpassinfo
+evr bind startofwafer StartOfWafer
+set BinDir "/exec/apps/bin/evr/OCR"
+set Info(HOST) [ eval exec "hostname" ]
+set Info(floor) "/floor/data/results_map"
+set Info(LogFile) "/data/probe_logs/OCR/OCR.$Info(HOST)"
+set Info(HOST) [ eval exec "hostname" ]
+set conf(OCR_WRITE) [file join $BinDir etc ocr_write.sh]
+reset
+        wm withdraw .
+        wm geometry . {}
+#        toplevel .buttonMenu
+#        wm overrideredirect .buttonMenu true
+#        label .buttonMenu.l -bg #9478FF -fg white -text "OCR test"
+#        button .buttonMenu.debug -text test -bg green -fg black -command {
+#		warning $window(warning)  "$BinDir/etc/warnning.gif"
+#        }
+#        pack .buttonMenu.l .buttonMenu.debug -side top -expand yes -fill both
+#       wm geometry .buttonMenu "-0-150"
+#        wm deiconify .buttonMenu
+

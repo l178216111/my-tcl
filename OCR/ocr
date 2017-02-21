@@ -1,0 +1,12 @@
+#!/bin/sh
+
+BIN_DIR=/exec/apps/bin/evr/OCR
+
+WISH=/exec/apps/bin/ctk/start_wish_3.6
+CODE=$BIN_DIR/`basename $0`.tcl
+
+
+
+export BIN_DIR
+
+exec $WISH $CODE

@@ -1,0 +1,3182 @@
+#!/usr/local/bin/wctksh_3.2
+#####################################################################
+#	20140718	Update for Cancel ShortBake if ShortTerm is not NULL
+#			Special soak dialog pop up if ShortTerm is not NULL and Interval < 1800
+#	
+#	20140903	ShortTerm bake(NoBake,ShortBake).
+#			EMS Ualarm when first wafer soak done.
+#			EMS UAlarm when Manual DieToDie Bake.
+#			EMS NoAlarm when any Auto Bake.
+#			Die-Die auto bake(Die2Die:Auto/Manual).
+#			Cold Probe combination.
+#			logs.
+#####################################################################
+##  COMMON TIME STAMPS
+##
+proc TIME_STAMPd {} {
+	# Example: Wed May 20 07:09:34 2009
+	return [clock format [clock seconds] -format "%c"]
+}
+
+proc TIME_STAMPf {} {
+	# Example: 20090520-070930
+	#Problem with Y wrapped with % signs
+	set a [clock format [clock seconds] -format "%y%m%d-%H"]
+	set b [clock format [clock seconds] -format "%M"]
+	set c [clock format [clock seconds] -format "%S"]
+	set d "${a}${b}${c}"
+	#Need to hardcode 20, because %Y followed by %m will be converted by SCCS
+	return "20$d"
+	}
+
+proc TIME_STAMPm {} {
+	# Example: 200905
+	#Problem with Y wrapped with % signs
+	set a [clock format [clock seconds] -format "%y%m"]
+	#Need to hardcode 20, because %Y followed by %m will be converted by SCCS
+	return "20$a"
+}
+
+proc TIME_STAMPs {} {
+	# Example: 1242828567
+	return [clock seconds]
+}
+
+proc TIME_STAMPt {} {
+	# Example: 05/20/09 07:09:38
+	return [clock format [clock seconds] -format "%D %T"]
+}
+
+##############################################################
+## Get T1 time
+##############################################################
+proc read_inf {} {
+
+	global Info INFData LogDir
+	
+# add by Jiang Nan to avoid auto-corr wafer's chuck time
+	if {[string compare $Info(LotID) "KK99999.2L"] == 0} {
+		set Info(T1) 0
+		WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "read_inf: ignore auto-corr map $Info(LotID)"
+		return
+	}
+# end	
+
+	set datadir /floor/data/results_map
+
+	set file $datadir/${Info(Device)}/${Info(LotID)}/r_${Info(WaferID)}
+#	WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "read_inf: Start Reading INF file $file"
+	
+	set handle [ open $file ]
+	inf infcmd
+	infcmd load -exclude $handle Evant
+	close $handle
+
+	set Info(T1) 0
+
+	set smwaferflow [infcmd blocks -recursive -unique SmWaferFlow]
+
+	set smtestflow [$smwaferflow blocks -unique SmTestFlow ]
+	foreach pass [ $smtestflow blocks SmPass ] {
+		set temp [ $pass blocks SmTempCntl ]
+		set temp_value [ $temp data -unique HOTP ]
+		if { $temp_value > 40 } {
+			set pass_id [$pass data -unique PASS_ID]
+			set INFData(pass${pass_id}->hot_chuck) 1
+		} else {
+			set pass_id [$pass data -unique PASS_ID]
+			set INFData(pass${pass_id}->hot_chuck) 0
+		}
+	}
+
+	foreach smwaferpass [concat [infcmd blocks -recursive -noerror smwaferpass] [infcmd blocks -recursive -noerror smwaferpassabandoned] ] {
+		set smwaferpass_passid [$smwaferpass data -unique PASS_ID ]
+		if { $INFData(pass${smwaferpass_passid}->hot_chuck) == 1 } {
+			set start_time [ $smwaferpass data -unique stti ]
+			set start_time_sec [ clock scan $start_time ]
+			set end_time [  $smwaferpass data -unique enti ]
+			set end_time_sec [ clock scan $end_time ]
+			set Info(T1) [ expr  $Info(T1) + $end_time_sec - $start_time_sec ]
+		}
+	}
+	WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "read_inf: Read Complete, Info(T1) = $Info(T1)"
+}
+
+###############################################################
+## Get Lot Info
+###############################################################
+proc SetupInfo { station wsize xsize ysize xref yref flat orientation yldhi yldlo lotid } {
+	global Info LogDir Debug_Flag
+	set Info(LotID) [string toupper $lotid]
+	WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetupInfo: Setting Info(LotID) = $Info(LotID)"
+}
+
+###############################################################
+# gets the Env Variable of variable
+# returns "not set" if unavailable
+###############################################################
+proc get_env {variable} {
+	global env
+	foreach var [array names env] {
+		if { [string compare $var $variable] == 0 } {
+			return $env($var)
+		}
+	}
+	return "not set"
+}
+
+
+###############################################################
+#       startLot
+###############################################################
+proc StartOfLot {station} {
+
+	global Info Debug_Flag LogDir FirstWafer BinDir
+	set Info(WaferCount) 0
+	set FirstWafer 0
+	WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "StartOfLot: Lot Start, Set FirstWafer = 0, Info(WaferCount) = 0"
+
+	# add wafer to wafer soak check. (for config file & setup file)
+	#SFDE1 => stop at first die(1 yes,0 no) , SFDWF1 => stop at every x wafer,  SFDEPA1 => stop at first die prober alarm?(1 yes,0 no)
+#	puts "jn debug: $Info(SAFDE),$Info(PauseSoak),$Info(SFDE:$Info(Sort)),$Info(SFDWF:$Info(Sort)),$Info(SFDEPA:$Info(Sort))"
+	if {[string equal $Info(SAFDE) "yes"] && $Info(PauseSoak) != ""  && $Info(PauseSoak) != 0} {
+		if { $Info(SFDE:$Info(Sort)) == 1 && $Info(SFDWF:$Info(Sort)) == 1 && $Info(SFDEPA:$Info(Sort)) == 0} {
+			WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "StartOfLot: Navigator wafer to wafer soak param check pass"
+		} else {
+			showabortlot "Navigator Parameter Error" "SAFD" $station
+			set category "SAFD"
+			set cmd "$BinDir/SendMail.pl $Info(Device) $Info(LotID) $Info(Sort) $category $Info(HOST) "
+			if { [catch {set sendmail [eval exec "$cmd"]} err] } {
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "StartOfLot: SendMail ERROR when executing $cmd : $err"
+			} 
+		}
+	}
+	# add send mail function for using default parameter
+	if { $Info(isDefaultConfig) == 1} {
+		set category "Default"
+		set cmd "$BinDir/SendMail.pl $Info(Device) $Info(LotID) $Info(Sort) $category $Info(HOST) "
+		if { [catch {set sendmail [eval exec "$cmd"]} err] } {
+			WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "StartOfLot: SendMail ERROR when executing $cmd : $err"
+		} 
+	} 
+}
+###############################################################
+# At the start of each wafer DO:
+###############################################################
+proc StartOfSession {station pass} {
+	global Info LogDir Debug_Flag CPLE_First_Wafer_Time_End
+
+	set Info(F_Step) 0
+	incr {Info(WaferCount)}
+#	set time_tmp [TIME_STAMPt]
+	WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "StartOfSession: Session Start, increase Info(WaferCount), now is $Info(WaferCount)."
+
+}
+
+###############################################################
+# Get the setup file and read the configuration file
+###############################################################
+proc SetupName { station floordir setupfile } {
+
+	global Info Debug_Flag LogDir temperaturechange_flag BinDir
+
+	set Info(Path) $floordir
+	set Info(Device) $setupfile	
+#Gather all the HOT chuck setting for the setup
+	set Path [ string trimright $floordir 1 ]  
+	set file_path $Path/$Info(Device)
+	if {$Info(WriteLog4GetSeup) == 0} {
+		WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetupName: Set reference setup file as $file_path"
+	}
+
+#suspect $i is max pass, if pass is over 10, this need to change.
+
+	for {set i 1 } {$i < 10 } {incr i} {
+		set Info(HCE:${i}) 0
+		set Info(HOTP:${i}) 25
+#need to rewrite the script while runing on Linux System. for future if local tester change to Linux
+		set cmd "$BinDir/etc/getVal $file_path HCE${i}"
+		if { [catch {set Temp [eval exec "$cmd"]} err] } {
+			WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetupName: ERROR when executing $cmd : $err"
+		} else {
+			if { [ string compare $Temp "" ] != 0 } {
+				set Info(HCE:${i}) $Temp
+				if {$Info(WriteLog4GetSeup) == 0} {
+					WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetupName: Pass ${i} has HCE set to $Info(HCE:${i})"
+				}
+			}
+		}
+
+		set cmd "$BinDir/etc/getVal $file_path HOTP${i}"
+		if { [catch {set Temp [eval exec "$cmd"]} err] } {
+			WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetupName: ERROR when executing $cmd : $err"
+		} else {
+			if { [ string compare $Temp "" ] != 0 } {
+				set Info(HOTP:${i}) $Temp
+				if {$Info(WriteLog4GetSeup) == 0} {
+					WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetupName: Pass ${i} has HOTP set to $Info(HOTP:${i})"
+				}
+			}
+		}
+		
+		# SFDE1 => stop at first die(1 yes,0 no) , SFDWF1 => stop at every x wafer,  SFDEPA1 => stop at first die prober alarm?(1 yes,0 no)
+		# actually this way should use a proc. - Nan.
+		set cmd "$BinDir/etc/getVal $file_path SFDE${i}"
+		if { [catch {set Temp [eval exec "$cmd"]} err] } {
+			WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetupName: ERROR when executing $cmd : $err"
+		} else {
+			if { [ string compare $Temp "" ] != 0 } {
+				set Info(SFDE:${i}) $Temp
+				if {$Info(WriteLog4GetSeup) == 0} {
+					WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetupName: Pass ${i} has SFDE set to $Info(SFDE:${i})"
+				}
+			}
+		}
+		
+		set cmd "$BinDir/etc/getVal $file_path SFDWF${i}"
+		if { [catch {set Temp [eval exec "$cmd"]} err] } {
+			WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetupName: ERROR when executing $cmd : $err"
+		} else {
+			if { [ string compare $Temp "" ] != 0 } {
+				set Info(SFDWF:${i}) $Temp
+				if {$Info(WriteLog4GetSeup) == 0} {
+					WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetupName: Pass ${i} has SFDWF set to $Info(SFDWF:${i})"
+				}
+			}
+		}
+		
+		set cmd "$BinDir/etc/getVal $file_path SFDEPA${i}"
+		if { [catch {set Temp [eval exec "$cmd"]} err] } {
+			WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetupName: ERROR when executing $cmd : $err"
+		} else {
+			if { [ string compare $Temp "" ] != 0 } {
+				set Info(SFDEPA:${i}) $Temp
+				if {$Info(WriteLog4GetSeup) == 0} {
+					WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetupName: Pass ${i} has SFDEPA set to $Info(SFDEPA:${i})"
+				}
+			}
+		}
+
+	}
+#Example TOAL_exclude.txt entry
+#B9++++L86J_M {
+#        passes:1
+#}
+
+	# set Info(PassCheck) $Info(DefaultPass)
+	# if [ catch {set MOO [eval exec "$BinDir/etc/find_moo $Info(Device) C7888 $SOAK_Info "]} err] {
+		# WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetupName: Unable read $SOAK_Info $err"
+		# genabortlotfunc "SUN System Error" "Meet system error:$err, the hot chunck can not continue. Please reboot SUN Station!!" "" $station
+
+	# } else {
+		# if {$Info(WriteLog4GetSeup) == 0} {
+			# WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetupName: Found match at $SOAK_Info for $Info(Device) as $MOO"
+		# }
+		# if { [ string compare $MOO "NONE" ] == 0 } {
+		# } else {
+			# set handle [open "$SOAK_Info"]
+			# inf iconfig
+			# iconfig load $handle
+			# close $handle
+
+			# if [catch { set isetup [iconfig blocks -unique $MOO] } err] {
+				# WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetupName: Unable to read $MOO block, $err"
+			# } else {
+				# # Read pass info
+				# if [catch { set Info(PassCheck) [$isetup data -noerror passes ] } err ] {
+					# if {$Info(WriteLog4GetSeup) == 0} {
+						# WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetupName: No Exculsion passes defined for $MOO, $err"
+					# }
+				# } else {
+					# if {$Info(WriteLog4GetSeup) == 0} {
+						# WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetupName: Passes $Info(PassCheck) are excluded from any HOT soak pausing"
+					# }
+				# }
+			# }
+		# }
+	# }
+
+#flag for write log	
+	set Info(WriteLog4GetSeup) 1
+}
+
+###############################################################
+# Infomessage to define when to reset
+###############################################################
+proc InfoMessage { station message } {
+	global Info LogDir
+	
+	if [regexp {^Starting wafer session ([^ ]+)} $message match wafer] {
+		set Info(WaferID) $wafer
+	}
+	
+# add by Jiang for new CPLE auto-correlation function;
+
+	if {[ string equal $message "Starting auto-correlation" ] } {
+		WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "InfoMessage: $message, CPLEClass is $Info(CPLEClass)"
+		if {[string compare [ string tolower $Info(CPLEClass) ] "yes" ] == 0 } {
+			evr send pause -alarm $station
+		}
+	}
+#end
+ # add by fengsheng for send message to TTT function;
+	if {[ regexp {RETEST} $message ]} {
+		set Info(isReprobe) 1
+	}
+#end
+}
+
+###############################################################
+# Error message evr to return the prober error message
+###############################################################
+proc ErrMsg { station severity errno message } {
+	global LogDir Info
+	if [ regexp {^Prober is not ready} $message ] {
+		WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "ErrMsg: $message"
+	}
+
+}
+
+###############################################################
+# get sort number
+###############################################################
+proc WaferInfo { station wafer_id passnumber subpass xrefoffset yrefoffset yield testable zwindow } {
+
+	global Info LogDir Debug_Flag SetupFlag
+
+	set Info(Sort) $passnumber
+	set Info(WaferID) "$wafer_id"
+	WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "WaferInfo: Setting WaferID = $Info(WaferID), Sort = $Info(Sort)"
+    
+	set WaferId $Info(WaferID)
+    set temp [split $WaferId -]
+    set Info(Wafer) [lindex $temp 1]
+	
+	if { $Info(HCE:${passnumber}) == "1" } {
+	# change to 0<x<40  by JiangNan 20150625
+		if { $Info(HOTP:${passnumber}) > 40 || $Info(HOTP:${passnumber}) < 0 } {
+			
+			set SetupFlag 1
+			#set type to hot or cold by navigator defined 
+			if { $Info(HOTP:${passnumber}) > 40 } {
+				set Info(Type) hot
+			} elseif { $Info(HOTP:${passnumber}) < 0 } {
+				set Info(Type) cold
+			}
+			set Info(Temperature) $Info(HOTP:${passnumber})
+			
+			set Info(HOT_flag) 1
+
+			# setting default parameter here, so we need to confirm it only execute once!
+                        if { $Info(LoadDefault) == 0 } {
+                                SetDefaultParam
+                                set Info(LoadDefault) 1
+                        }
+			WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "WaferInfo: $Info(Device) is probed at $Info(HOTP:${passnumber})C and will trigger TOAL checks."
+
+		} else {
+			WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "WaferInfo: $Info(Device) is probed at $Info(HOTP:${passnumber})C but will not trigger TOAL checks."
+		}
+	}
+
+}
+
+# set default params for hot part.
+
+proc SetDefaultParam {} {
+	global Info Clock_Info LogDir
+	set handle [open "$Clock_Info"]
+	inf iconfig
+	iconfig load $handle
+	close $handle
+	WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetDefaultParam: running"
+	PutsDebug "Type $Info(Type)"	
+
+	# choose hot or cold default param
+	if { [ string compare [ string tolower $Info(Type) ] "hot" ] == 0} {
+		set default_type "Hot_Default"
+	} elseif { [ string compare [ string tolower $Info(Type) ] "cold" ] == 0} {
+		set default_type "Cold_Default"
+	} else {
+		set default_type "Default"
+	}
+	
+	if [catch { set isetup [iconfig blocks -unique $default_type ] } err] {
+		WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetDefaultParam:  Error: $err for $Info(Device) : $Info(Sort) "
+		evr send abortlot 0
+		evr send reset 0
+		tk_dialog .oops "Hot Chunck Confirm" "Error: invalid configuration file format for default Param" warning 0 "OK"
+	} else {
+		
+#		if [ catch { set Info(SAFDE) [$isetup data -unique -noerror SAFDE ] } ] {
+#			if {$Info(WriteLog4SetDefault) == 0} {
+#				set Info(SAFDE) "yes"
+#				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetDefaultParam: SAFDE for $Info(Device): $Info(LotID) : $Info(Sort) , null"
+#			}
+#		} else {
+#			if [string equal $Info(SAFDE) ""] {
+#				set Info(SAFDE) "yes"
+#			}
+#			if {$Info(WriteLog4SetDefault) == 0} {
+#				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetDefaultParam: SAFDE for $Info(Device) :$Info(LotID) : $Info(Sort) : $Info(SAFDE)"
+#			}
+#		}
+
+		if [catch { set Info(RecoverTimer) [$isetup data -unique -noerror RecoverTimer ] } err ] {
+			if {$Info(WriteLog4SetDefault) == 0} {
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetDefaultParam: RecoverTimer for $err $Info(Device): $Info(LotID) : $Info(Sort) "
+			}
+		} else {
+			if {$Info(WriteLog4SetDefault) == 0} {
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetDefaultParam: RecoverTimer for $Info(Device) : $Info(LotID) : $Info(Sort) : $Info(RecoverTimer) "
+			}
+		}
+
+		if [catch { set Info(SoakTimer) [$isetup data -unique -noerror SoakTimer ] } ] {
+			if {$Info(WriteLog4SetDefault) == 0} {
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetDefaultParam: SoakTimer for $Info(Device) :$Info(LotID) : $Info(Sort) "
+			}
+		} else {
+			if {$Info(WriteLog4SetDefault) == 0} {
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetDefaultParam: SoakTimer for $Info(Device) :$Info(LotID) : $Info(Sort) : $Info(SoakTimer) "
+			}
+		}
+
+		if [ catch { set Info(ShortTerm) [$isetup data -unique -noerror ShortTerm ] } ] {
+			if {$Info(WriteLog4SetDefault) == 0} {
+			WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetDefaultParam: ShortTerm for $Info(Device): $Info(LotID) : $Info(Sort) "
+			}
+		} else {
+			if {$Info(WriteLog4SetDefault) == 0} {
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetDefaultParam: ShortTerm for $Info(Device) :$Info(LotID) : $Info(Sort) : $Info(ShortTerm) "
+			}
+		}
+		
+		#### Add NoBake point by fengsheng #######
+		if [ catch { set Info(NoBake) [$isetup data -unique -noerror NoBake ] } ] {	
+			if {$Info(WriteLog4SetDefault) == 0} {
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetDefaultParam: NoBake for $Info(Device): $Info(LotID) : $Info(Sort) "				
+			}					
+		} else {
+			if {$Info(WriteLog4SetDefault) == 0} {
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetDefaultParam: NoBake for $Info(Device) :$Info(LotID) : $Info(Sort) : $Info(NoBake) "	
+			} 
+		}				
+		PutsDebug "Info(NoBake)=$Info(NoBake)"
+		#### Add ShortBake point by fengsheng######					
+		if [ catch { set Info(ShortBake) [$isetup data -unique -noerror ShortBake ] } ] {
+			if {$Info(WriteLog4SetDefault) == 0} {		
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetDefaultParam: ShortBake for $Info(Device): $Info(LotID) : $Info(Sort) "				
+			}			
+		} else {
+			if {$Info(WriteLog4SetDefault) == 0} {		
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetDefaultParam: ShortBake for $Info(Device) :$Info(LotID) : $Info(Sort) : $Info(ShortBake) "
+			}					
+		}
+		if { $Info(ShortBake) == "" } {
+			set Info(ShortBake) 1800
+			PutsDebug "ShortBake use Default:1800"
+		}
+		PutsDebug "Info(ShortBake)=$Info(ShortBake)"
+		if { $Info(NoBake) == "" } {
+			set Info(NoBake) 0
+			PutsDebug "NoBake is ShortBake:$Info(ShortBake)"
+		}
+		PutsDebug "Info(NoBake)=$Info(NoBake)"
+		if [ catch { set Info(die2die) [$isetup data -unique -noerror Die2Die ] } ] {
+			if {$Info(WriteLog4SetDefault) == 0} {
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetDefaultParam: Die2Die for $Info(Device): $Info(LotID) : $Info(Sort) "
+			}
+		} else {
+			if {$Info(WriteLog4SetDefault) == 0} {
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetDefaultParam: Die2Die for $Info(Device) :$Info(LotID) : $Info(Sort) : $Info(die2die) "
+			}
+		}
+		if { $Info(die2die) == "" || [string compare $Info(die2die) "Auto"] == 0 } {
+			set Info(die2die) "Auto"
+			set Info(d2d_flag) 0
+		}
+		if { [string compare $Info(die2die) "Manual"] == 0 } {
+			set Info(d2d_flag) 1
+		}
+		PutsDebug "Info(die2die)=$Info(die2die)"
+
+		#if [ catch { set Info(Center) [$isetup data -unique -noerror Center ] } ] {
+		#	if {$Info(WriteLog4SetDefault) == 0} {
+		#		WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetDefaultParam: Center for $Info(Device): $Info(LotID) : $Info(Sort) "
+		#	}
+		#} else {
+		#	if {$Info(WriteLog4SetDefault) == 0} {
+		#		WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetDefaultParam: Center for $Info(Device) :$Info(LotID) : $Info(Sort) : $Info(Center) "
+		#	}
+		#}
+
+		if [ catch { set Info(PauseSoak) [$isetup data -unique -noerror PauseSoak ] } ] {
+			if {$Info(WriteLog4SetDefault) == 0} {
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetDefaultParam: PauseSoak for $Info(Device): $Info(LotID) : $Info(Sort) :$Info(PauseSoak) "
+			}
+		} else {
+			if {$Info(WriteLog4SetDefault) == 0} {
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetDefaultParam: PauseSoak for $Info(Device) :$Info(LotID) : $Info(Sort) : $Info(PauseSoak) "
+			}
+		}
+		
+		if [ catch { set Info(D2D_IntervalMax) [$isetup data -unique -noerror D2D_IntervalMax ] } ] {
+			if {$Info(WriteLog4SetDefault) == 0} {
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetDefaultParam: D2D_IntervalMax for $Info(Device): $Info(LotID) : $Info(Sort) "
+			}
+		} else {
+			if {$Info(WriteLog4SetDefault) == 0} {
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetDefaultParam: D2D_IntervalMax for $Info(Device) :$Info(LotID) : $Info(Sort) : $Info(D2D_IntervalMax) "
+			}
+		}
+		
+		if [ catch { set Info(D2D_IntervalMin) [$isetup data -unique -noerror D2D_IntervalMin ] } ] {
+			if {$Info(WriteLog4SetDefault) == 0} {
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetDefaultParam: D2D_IntervalMin for $Info(Device): $Info(LotID) : $Info(Sort) "
+			}
+		} else {
+			if {$Info(WriteLog4SetDefault) == 0} {
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetDefaultParam: D2D_IntervalMin for $Info(Device) :$Info(LotID) : $Info(Sort) : $Info(D2D_IntervalMin) "
+			}
+			# default IntervalMin set to IntervalMax
+			if { [string equal $Info(D2D_IntervalMin) ""] } {
+				set Info(D2D_IntervalMin) $Info(D2D_IntervalMax)
+			}
+		}
+		
+		if [ catch { set Info(D2D_SoakMax) [$isetup data -unique -noerror D2D_SoakMax ] } ] {
+			if {$Info(WriteLog4SetDefault) == 0} {
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetDefaultParam: D2D_SoakMax for $Info(Device): $Info(LotID) : $Info(Sort) "
+			}
+		} else {
+			if {$Info(WriteLog4SetDefault) == 0} {
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetDefaultParam: D2D_SoakMax for $Info(Device) :$Info(LotID) : $Info(Sort) : $Info(D2D_SoakMax) "
+			}
+		}
+		if [ catch { set Info(D2D_SoakMin) [$isetup data -unique -noerror D2D_SoakMin ] } ] {
+			if {$Info(WriteLog4SetDefault) == 0} {
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetDefaultParam: D2D_SoakMin for $Info(Device): $Info(LotID) : $Info(Sort) "
+			}
+		} else {
+			if {$Info(WriteLog4SetDefault) == 0} {
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SetDefaultParam: D2D_SoakMin for $Info(Device) :$Info(LotID) : $Info(Sort) : $Info(D2D_SoakMin) "
+			}
+			if { [string equal $Info(D2D_SoakMin) ""] } {
+				set Info(D2D_SoakMin) 0
+			}
+		}
+	}
+	set Info(WriteLog4SetDefault) 1
+	set Info(isDefaultConfig) 1
+}
+
+###############################################################
+# CountDown
+#
+#       Helper procedure called by the first die pause dialog.
+#       Implement a 1 second count-down timer and destroy the dialog
+#       when you get to zero.
+#
+###############################################################
+proc CountDown {} {
+	global Info gPause .dlg3 frm2 LogDir Debug_Flag pauseDlg
+
+	if { ! [ winfo exists .dlg3 ] } {
+		grab release .dlg2
+		destroy .dlg2
+		return 0
+	}
+	if {$gPause > 0 && $Info(TOALing) == 1 } {
+		$frm2.txt delete 1.0 end
+		$frm2.txt insert 1.0 $gPause
+		incr gPause -1
+		after 1000 CountDown
+	} else {
+		WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "CountDown: CountDown concluded"
+		destroy .dlg3
+	}
+}
+
+###############################################################
+# FdPauseDialog
+###############################################################
+proc FdPauseDialog {count} {
+	global Info gPause .dlg3 frm2 Debug_Flag LogDir BinDir pauseDlg
+
+	set gPause $count
+	PutsDebug "FdPauseDialog:DieToDie Bake start,seconds=$count"
+	WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "FdPauseDialog:DieToDie Bake start,seconds=$count"
+
+	# a small GUI for the dialog box
+	wm withdraw .
+	wm geometry . {}
+
+	set pauseDlg .dlg3
+	toplevel $pauseDlg
+	wm geometry $pauseDlg "-90+120"
+	wm overrideredirect $pauseDlg true
+	wm title $pauseDlg "Total Alignment ctr"
+	frame $pauseDlg.frm -background yellow
+
+	pack $pauseDlg.frm
+	set frm2 $pauseDlg.frm.f2
+	frame $frm2
+	label $frm2.lbl -text "DieToDie Bake\nTime remaining\nin seconds" -font [list helvetica 28 bold] -foreground black -background yellow
+	
+	text $frm2.txt -relief ridge -font [list helvetica 42 bold] -foreground red -background yellow -width 5 -height 1
+	########## add by fengsheng for die2die cancel function #######
+	if { $Info(d2d_flag) == 1 } {
+		set map "$BinDir/etc_pic_$Info(Type)/cancel.gif"
+		set im [image create photo -file $map]
+		button $frm2.stop  -command "Cancel soak" -bg red -bd 5 -image $im
+		pack $frm2.stop -side bottom -expand yes -fill both
+	}
+	######################################## 
+	
+	pack $frm2.lbl $frm2.txt -side left -expand true -fill both
+	pack $frm2 -side top
+	focus -force $pauseDlg
+	tkwait visibility $pauseDlg
+	grab set -global $pauseDlg 
+	after 1000 RaiseWindow $pauseDlg
+	after 1000 CountDown
+	tkwait window $pauseDlg
+}
+
+###############################################################
+# PauseButton
+###############################################################
+proc PauseButton {} {
+	global Info BinDir .dlg2 Debug_Flag LogDir
+
+	if { [ winfo exists .dlg2 ] } {
+		grab release .dlg2
+		destroy .dlg2
+	}
+	WriteFile "$LogDir/clock/clock.out.$Info(HOST)"  "PauseButton: DieToDie window pop-up"
+	set pauseBtn .dlg2
+	toplevel $pauseBtn
+	wm geometry $pauseBtn "-100+200"
+	wm overrideredirect $pauseBtn true
+	wm title $pauseBtn "Total Alignment Pause Event"
+	frame $pauseBtn.frm  -relief ridge
+	pack $pauseBtn.frm -side top -fill x
+
+	set map "$BinDir/etc_pic_$Info(Type)/HC1.gif"
+	set im [image create photo -file $map]
+	label $pauseBtn.frm.image1 -image $im
+
+	set map "$BinDir/etc_pic_$Info(Type)/HC5.gif"
+	set im [image create photo -file $map]
+	button $pauseBtn.b1 -relief ridge -font [list helvetica 20 bold] -foreground white -background red -image $im -command {
+		grab release .dlg2
+		destroy .dlg2
+	}
+
+	set map "$BinDir/etc_pic_$Info(Type)/HC3.gif"
+	set im [image create photo -file $map]
+	button $pauseBtn.b2 -relief ridge -font [list helvetica 20 bold] -foreground white -background lightblue -image $im -command {
+		grab release .dlg2
+		destroy .dlg2
+		set s_time [TIME_STAMPs]
+		if { [ Failure_Logging TOAL na none $Info(failure) ignore $s_time ] == 1 } {
+			WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "PauseButton: This single TOAL event was ignored."
+			set Info(TOALing) 0
+			grab release .dlg2
+			destroy .dlg2
+		}
+	}
+
+	set map "$BinDir/etc_pic_$Info(Type)/HC4.gif"
+	set im [image create photo -file $map]
+	button $pauseBtn.b3 -relief ridge -font [list helvetica 20 bold] -foreground white -background lightblue -image $im -command {
+		grab release .dlg2
+		destroy .dlg2
+		set passnumber $Info(Sort)
+		set s_time [TIME_STAMPs]
+		if { [ Failure_Logging TOAL na none $Info(failure) disabled $s_time ] == 1 } {
+			set Info(HOT_flag) 0
+			set passnumber $Info(Sort)
+			set Info(HCE:${passnumber}) 0
+			WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "PauseButton: doTOAL: TOAL has been disabled for this lot."
+			grab release .dlg2
+			destroy .dlg2
+		}
+	}
+	pack $pauseBtn.frm.image1 $pauseBtn.b1 $pauseBtn.b2 $pauseBtn.b3 -side top -expand true -fill both
+}
+
+###############################################################
+# PauseWindow
+###############################################################
+proc PauseWindow {} {
+	global Info .dlg1 Debug_Flag LogDir BinDir promisname
+
+	if { [ winfo exists .dlg1 ] } {
+		grab release .dlg1
+		destroy .dlg1
+	}
+	if { $Info(TOALing) == 0 } {
+		return
+	}
+	WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "PauseWindow: Pause Window pop-up"
+	set pauseWin .dlg1
+	toplevel $pauseWin
+	wm geometry $pauseWin "-150+300"
+	wm overrideredirect $pauseWin true
+	wm title $pauseWin "Total Alignment Pause Event"
+	frame $pauseWin.frm  -relief ridge
+	pack $pauseWin.frm -side top -fill x
+
+	set map "$BinDir/etc_pic_$Info(Type)/HC6.gif"
+	set im [image create photo -file $map]
+	label $pauseWin.frm.image1 -image $im
+
+	button $pauseWin.b1 -relief ridge -font [list helvetica 36 bold] -foreground white -background red -text "OK" -command {
+		set s_time [TIME_STAMPs]
+		if { [ Failure_Logging TOAL na none $Info(failure) none $s_time ] == 1 } {
+			grab release .dlg1
+			destroy .dlg1
+		}
+	}
+
+	pack $pauseWin.frm.image1 $pauseWin.b1 -side top -expand true -fill both
+	##################################
+	PutsDebug "send MDTDAlarm to EMS start"
+	set comments "MDTDAlarm"
+	set msg [Generate_EPR_Msg  "Unscheduled Down" "$promisname \"\" \"\" true" "" "ALARM_SET" "\"SUBSTATE Ualarm \" \"LOT_ID  $Info(LotID) \" \"DEVICE_ID $Info(Device)  \" \"REPROBE $Info(isReprobe)  \" \"COMMENTS $comments \" \"OPERATOR_ID $Info(OperID)  \" \"PROBECARD_ID $Info(PCID)  \" \"PROBECARD_TYPE $Info(PCType) \" \"WAFER_ID $Info(Wafer) \" \"PASS  $Info(Sort)\" " ""]
+	Msg_To_TTT $msg
+	PutsDebug "send MDTDAlarm to EMS complete"
+	WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "PauseWindow,send MDTDAlarm to EMS complete"
+	##################################
+}
+
+###############################################################
+#instruction for HOT sock check
+###############################################################
+proc doTOAL {station failure} {
+	global Info BinDir Debug_Flag LogDir
+	if { $Info(TOALing) == 1 } {
+		return
+	}
+	set Info(TOALing) 1
+	if { [winfo exists .do_TOAL] } {
+		return
+	}
+	if { $Info(d2d_flag) == 1 } {
+		evr send pause -alarm $station
+		evr delay 1000
+		#Start of TOAL check
+		PauseButton
+		tkwait visibility .dlg2
+		catch { grab .dlg2 }
+		# wait .dlg2 destroy
+		tkwait window .dlg2
+	}
+	WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "doTOAL, WaferCount: $Info(WaferCount) Delay: $Info(TGap) FailureMode: $failure"
+	if { [string compare $Info(J971) "YES"] == 0 } {
+		evr send zup $station
+	}
+	set passnumber $Info(Sort)
+	##########for debug######
+	#       set Info(HCE:1) 1
+	#       set Info(TOALing) 1
+
+	if { $Info(HCE:${passnumber}) == "1" } {
+		#5 minute count down timer
+		if { $Info(TOALing) == 0 } {
+			set Info(TGap) 0
+			evr send start $station
+			set Info(STtime) [TIME_STAMPs]
+			return
+		}
+#		FdPauseDialog $Info(D2D_SoakMax)
+
+# change by JiangNan, add dynamic time for d2d soak
+		set D2D_SoakTime [getSoakTime $Info(TGap)]
+# change over
+
+		FdPauseDialog $D2D_SoakTime
+		if { $Info(d2d_flag) == 1 } {
+			PauseWindow
+		}
+		if { $Info(TOALing) == 0 } {
+			return
+		}
+		if { $Info(d2d_flag) == 1 } {
+			tkwait visibility .dlg1
+			catch { grab .dlg1 }
+			tkwait window .dlg1
+		}
+	}
+	set Info(TGap) 0
+	set Info(STtime) [TIME_STAMPs]
+	if { $Info(d2d_flag) == 0 } {
+		set Info(Die2DieSoak) 0
+		set Info(TOALing) 0
+	}
+	evr send start $station
+	PutsDebug "doTOAL:DieToDie bake over,Resume Test session"
+	WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "doTOAL:DieToDie bake over,Resume Test session"
+}
+
+
+proc getSoakTime {interval} {
+	global Info
+	
+	set ymax [format "%.1f" $Info(D2D_SoakMax)]
+	set ymin [format "%.1f" $Info(D2D_SoakMin)]
+	set xmax [format "%.1f" $Info(D2D_IntervalMax)]
+	set xmin [format "%.1f" $Info(D2D_IntervalMin)]
+	puts "ymax=$ymax,ymin=$ymin,xmax=$xmax,xmin=$xmin"
+	if {$xmax == $xmin} {
+		return [format "%.0f" $Info(D2D_SoakMax)]
+	}
+	set coefficient [expr [expr $ymax - $ymin ] / [expr $xmax - $xmin]]
+	set intercept [expr $ymax - $coefficient * $xmax]
+	
+	puts "a=$coefficient,b=$intercept"
+	
+	if {$interval >= $Info(D2D_IntervalMax)} {
+		return [format "%.0f" $Info(D2D_SoakMax)]
+	} elseif {$interval < $Info(D2D_IntervalMin)} {
+		return 0
+	} else {
+		return [format "%.0f" [expr $coefficient * $interval + $intercept]]
+	}
+	return -1
+}
+
+###############################################################
+# TOAL Pause Logger
+# User authentication use .X500 login/password
+# Record necessary information for the event
+#      MOO, Event Type, Limit, Trigger/Bin
+#      Responce, Host, Date/Time, Delay, Responder
+#      Lot, Wafer, Pass, PCID, PIB, Pogo Stack
+###############################################################
+proc Failure_Logging {type site limit failure action s_time} {
+	global Info BinDir LogDir Debug_Flag
+
+	if [catch { set USER_AUTH [eval exec "$BinDir/etc/login_screen"] } err ] {
+		return 0
+	} else {
+		while { [string last "fail" $USER_AUTH] >= 0 } {
+			set USER_AUTH [eval exec "$BinDir/etc/login_screen" ]
+		}
+	}
+
+	set d_time [TIME_STAMPt]
+	set delay [eval exec "$BinDir/etc/cal_delay $s_time" ]
+
+	set failureL "Unknown"
+	set actionL "Total Alignment"
+	if { [string compare $Info(failure) "start" ] == 0 } {
+		set failureL "Second Wafer Start"
+	}
+	if { [string compare $Info(failure) "time" ] == 0 } {
+		set failureL "Inter-Test Delay"
+	}
+	if { [string compare $action "abort" ] == 0 } {
+		set actionL "Diabled For Lot"
+	}
+	if { [string compare $action "ignore" ] == 0 } {
+		set actionL "Ignored Event"
+	}
+
+	set wafer_num [string range $Info(WaferID) 2 end]
+	set context "$Info(Device),$type,$site,$limit,$failureL,$actionL,$Info(HOST),$d_time,$Info(TGap),$USER_AUTH,$Info(LotID),$wafer_num,$Info(Sort),$Info(WaferCount)"
+	WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "Failure_Logging: Entry for log : $context"
+	set Info(TOALing) 0
+	return 1
+}
+
+###############################################################
+# WriteFlag4CPLE First Wafer 
+#	abandoned by auto-corr solution  <- not effective
+###############################################################
+proc WriteFlag4CPLE {wafer chuck_last_time} {
+	set filename "/tmp/cple_first_info.txt"
+	set fh [open $filename "w" 0666]
+	set chuck_last_time [expr $chuck_last_time + 0.0 ]
+	set duration [ format "%.f" [expr $chuck_last_time / 60] ]
+	set text "FirstWafer:$wafer\nLastTime(Minutes):$duration\nLastTime(Seconds):$chuck_last_time"
+	puts $fh $text
+	close $fh
+}
+
+###############################################################
+# Status Message
+###############################################################
+proc StatusMsg {station message} {
+	global Info .cl BinDir LogDir Debug_Flag FirstWafer opset  Flag4CPLE_First_Wafer_Chuck CPLE_First_Wafer_Time_End CPLE_First_Wafer_Time_Start CPLE_Class promisname
+	set d_time [eval exec "$BinDir/etc/sys_time -t" ]
+		
+	set passnumber $Info(Sort)
+	if { [string compare $message "First_die" ] == 0 } {
+		set Info(move_now) 0
+		set d_time [TIME_STAMPt]
+#added by jiang		
+		if {[ string compare [ string tolower $Info(CPLEClass) ] "yes" ] == 0 && $Info(PauseSoak) != ""  && $Info(PauseSoak) != 0 } {
+			set Info(move_now) 1
+			WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "StatusMsg: Message = $message, set move_now = $Info(move_now) for CPLE"
+#			Counter_Lock
+#			evr send pause $station
+#			after 2000
+		}
+		
+		if {[ string compare [ string tolower $Info(SAFDE) ] "yes" ] == 0 && $Info(PauseSoak) != ""  && $Info(PauseSoak) != 0 } {
+			if {  $Info(WaferCount) != 0 } {
+				set Info(move_now) 1
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "StatusMsg: Message = $message, wafercount = $Info(WaferCount) , set move_now = $Info(move_now) for SAFDE part"
+			} else {
+ 				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "StatusMsg: SAFDE = $Info(SAFDE),FIRST WAFER = $FirstWafer, CPLEClass = $Info(CPLEClass) , wafercount  $Info(WaferCount)"
+				if {[ string compare [ string tolower $Info(CPLEClass) ] "yes" ] != 0} {
+					evr send start $station
+					WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "StatusMsg: send start for first wafer"
+				}
+			}
+		} 
+		
+	}
+
+	set wafer_num [ string range $Info(WaferID) 2 end ]
+	if { [ string compare $Info(WaferID) "" ] != 0 } {
+		if { $Info(ThanSixH_${wafer_num}) == 1 } {
+			set opset 1
+			WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "StatusMsg: $message, setting opset to 1"
+		}
+	}
+	######### If doesn't config Center parameter,then Abort LOT  ################
+	if { [ winfo exists .diexy ] } {
+		destroy .diexy
+	}
+
+# abandoned by JiangNan because Center is already calculate by script.	
+
+	if {0} {
+		if { $Info(PauseSoak) != "" && $Info(Center) == "" } {
+			PutsDebug "StatusMsg:Info(PauseSoak) is NotNull,but Info(Center) is NULL ! Then Abort lot now."
+			WriteFile "$LogDir/clock/clock.out.$Info(HOST)"  "StatusMsg:Info(PauseSoak) is NotNull,but Info(Center) is NULL !"
+			evr send pause $station
+			PutsDebug "StatusMsg: pause over."
+			after 2000
+			evr send abortlot $station
+			evr send reset $station	
+
+			PutsDebug "StatusMsg: abort over,then pop-up warning window."
+			toplevel .diexy
+			wm geometry .diexy "+600+200"
+			wm title .diexy "diexy Soak"
+			wm iconname .diexy Dialog		
+			frame .diexy.top -relief raised -bd 1
+			pack .diexy.top -side top -fill both	
+			frame .diexy.bot -relief raised -bd 1
+			pack .diexy.bot -side bottom -fill both
+			set map "$BinDir/etc/diexy.gif"
+			set im [image create photo -file $map]		
+			label .diexy.top.image -image $im
+			pack .diexy.top.image -side left -padx 5m -pady 5m
+			button .diexy.bot.button -text OK -command {
+				destroy .diexy	
+				return
+			}
+			pack .diexy.bot.button -side left -expand 1 \
+			-padx 5m -pady 5m -ipadx 2m -ipady 1m
+			return
+			WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "StatusMsg: abort over,diexy window pop-up."
+		} 
+	} else {
+	
+		WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "StatusMsg: message = $message, move_now is $Info(move_now) "
+		if { [ string compare $message "Pause" ] == 0 && $Info(move_now) == 1 } {
+			
+			#set timeout [ expr $Info(PauseSoak) * 1000 ]
+			set diex [ lindex [split $Info(Center) "," ] 0 ]
+			set diey [ lindex [split $Info(Center) "," ] 1 ]
+			
+			if {[string is integer $diex] && [string is integer $diey]} {
+				evr send move $station $diex $diey
+			} else {
+				tk_dialog .alarm_center "Critical Warning" "Error: invalid configuration about Center Die:$diex,$diey!\nPlease notice Process Engineer or Part Owner!!!" warning 0 "OK"
+			}
+			
+			WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "StatusMsg: $message,WaferToWafer Bake start,moved needle to $diex, $diey. seconds=$Info(PauseSoak)"
+		
+	#add by Jiang Nan
+			Counter_Lock $station
+	#end
+#			after $timeout
+#			destroy .cl
+#			set Info(move_now) 0
+#			set Info(STtime) [TIME_STAMPs]
+#			evr send start $station
+#			WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "StatusMsg: $message, WaferToWafer Bake over, send start"
+		}
+		
+		########## update by fengsheng to add auto-die2die Soak
+		if { $Info(d2d_flag) == 0 && $Info(D2D_SoakMax) != "" && $Info(D2D_SoakMax) != 0 } {
+			if { [ string compare $message "Pause" ] == 0 && $Info(Die2DieSoak) == 1 } {
+				
+				################# Move EMS Status Change after Pause #################
+				after 10000
+				PutsDebug "send DTDTesting to EMS start"			
+				set Info(AlarmTime) 0
+				set comments "DTDTesting"
+				set msg [Generate_EPR_Msg  "Productive" "$promisname \"\" \"\" true" "" "EQUIP_START" "\"SUBSTATE Running \" \"LOT_ID  $Info(LotID) \" \"DEVICE_ID $Info(Device)  \" \"REPROBE $Info(isReprobe)  \" \"COMMENTS $comments \" \"OPERATOR_ID $Info(OperID)  \" \"PROBECARD_ID $Info(PCID)  \" \"PROBECARD_TYPE $Info(PCType) \" \"WAFER_ID $Info(Wafer) \" \"PASS  $Info(Sort)\" " " \"ALARM_TIME $Info(AlarmTime) \" "]
+				Msg_To_TTT $msg
+				PutsDebug "send DTDTesting to EMS complete"
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "StatusMsg: send DTDTesting to EMS complete"
+				#######################################################################
+				
+				#set timeout [ expr $Info(D2D_SoakMax) * 1000 ]
+				set diex [ lindex [split $Info(Center) "," ] 0 ]
+				set diey [ lindex [split $Info(Center) "," ] 1 ]
+				if {[string is integer $diex] && [string is integer $diey]} {
+					evr send move $station $diex $diey
+				} else {
+					tk_dialog .alarm_center "Critical Warning" "Error: invalid configuration about Center Die:$diex,$diey!\n Please notice Process Engineer or Part Owner!!!" warning 0 "OK"
+				}
+				
+				PutsDebug "StatusMsg: $message, D2D Soak,moved needle to $diex, $diey"
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "StatusMsg: $message, D2D Soak,moved needle to $diex, $diey"
+				doTOAL ${station} $Info(failure)
+				set Info(Die2DieSoak) 0
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "StatusMsg: $message, D2D soak complete, send start"
+			}
+		}		
+		############ Auto-die2die end 
+	}
+}
+
+###############################################################
+# Start of Die Test
+###############################################################
+proc MoveCursor {station site x y} {
+	global Info LogDir Debug_Flag BinDir promisname
+# maybe we can add another condition into this loop to judge whether its hot part. 20140108  add by Jiang Nan.
+	if { $site == 0 } {
+		if { $Info(HOT_flag) == 1 } {
+			if { [string compare $Info(TestComWfrID) $Info(WaferID)] == 0 } {
+				set Info(ENtime) [TIME_STAMPs]
+				if { $Info(STtime) == 0 } {
+					set Info(TGap) 0
+				} else {
+					set Info(TGap) [ expr { $Info(ENtime) - $Info(STtime) } ]
+				}
+				PutsDebug "Info(TGap)=$Info(TGap),Info(D2D_IntervalMax)=$Info(D2D_IntervalMax)"
+				if { ( $Info(TGap) > $Info(D2D_IntervalMin) ) && $Info(D2D_IntervalMin) != "" } {
+					set Info(failure) time
+					# TOAL if die stepping time exceeds limit
+					WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "MoveCursor: Inter-test delay of $Info(TGap), Info(D2D_IntervalMax) config as $Info(D2D_IntervalMax), starting TOAL(die2die) check."
+					########### Moved die2die function to StatusMsg ##########
+					if { $Info(d2d_flag) == 0 && $Info(D2D_SoakMax) != "" && $Info(D2D_SoakMax) != 0 } {
+						set Info(Die2DieSoak) 1
+						evr send pause $station
+						# move EMS update to StatusMsg
+						PutsDebug "trigger Die2DieSoak pause"
+						WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "MoveCursor: trigger Die2DieSoak pause"
+					}
+				   #############################################
+				   if { $Info(d2d_flag) == 1 } {
+						doTOAL ${station} $Info(failure)
+					}
+				}
+			}
+			if { $Info(d2d_flag) == 1 } {
+				if { $Info(F_Step) == 1 } {
+					if { $Info(TOALing) == "1" } {
+						WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "MoveCursor: proc send pause"
+						evr send pause -alarm $station
+					}
+				}
+			}
+		}
+	}
+}
+
+###############################################################
+# End of Die Test
+###############################################################
+proc TestResults {station x y site testnumber bin sort} {
+	global Info LogDir Debug_Flag BinDir SetupFlag opset
+
+	if { $SetupFlag == 1 && $Info(MonitorHWafer) != "" } {
+		set Info(T2_end) [ clock seconds ]
+		set Info(T2) [expr $Info(T2_end) - $Info(T2_start) ]
+		set wafer_num [ string range $Info(WaferID) 2 end ]
+		set MonitorSecond [ expr $Info(MonitorHWafer) * 3600 ]
+		if { [ expr $Info(T2) + $Info(T1) ] > $MonitorSecond } {
+			WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "TestResults: Over MonitorSecond $MonitorSecond, sending pause"
+			set opset -1
+			set Info(ThanSixH_${wafer_num}) 1
+			evr send pause $station
+			tkwait variable opset
+			after 2000
+			evr send abortwafer $station
+			evr send start $station
+			WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "TestResults: Abort current wafer then continue."
+		}
+	}
+
+# add a new condition by Jiang for distinguish CPLE & other hot part
+	if { $Info(F_Step) == 0  && $Info(WaferCount) != 1 && $Info(PauseSoak) != ""  && $Info(PauseSoak) != 0 &&  [ string compare [string tolower $Info(CPLEClass) ] "yes" ] != 0 && [ string compare [string tolower $Info(SAFDE) ] "yes" ] != 0  } {
+	
+		#commend these line for test CPLE wafer to wafer hot chuck
+		WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "TestResults: the first die testing is finished for Wafer $Info(WaferID), wafercount is $Info(WaferCount) , and setting wafer to wafer flag \$move_now to 1."
+		set Info(move_now) 1
+# commented by Jiang and move this to Pause function
+#		Counter_Lock
+# comment end
+		evr send pause $station
+		after 2000
+		
+	}
+	
+	set Info(F_Step) 1
+	if { $Info(HOT_flag) == 1 } {
+		set Info(STtime) [TIME_STAMPs]
+	}
+	set Info(TestComWfrID) $Info(WaferID)
+}
+
+proc Counter_Lock {station} {
+	global .cl BinDir LogDir Info promisname wFlag w2w_minutes w2w_seconds w2w_tempMinutes
+	if { [ winfo exist .cl ] } {
+		focus -force .cl
+		return
+	}
+	
+	if { [ winfo exist .wclock ] } {
+		grab release .wclock
+		destroy .wclock
+	}
+	WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "Counter_Lock:WaferToWafer window pop-up."
+
+	# comment below lines for HuaWei's request, will change to tick window, abandon old alarm window.
+	
+#	set title {Soak when wafer to wafer}
+#	toplevel .cl -class Dialog
+#	wm title .cl $title
+#	wm iconname .cl Dialog
+
+#	frame .cl.top -relief raised -bd 1
+#	pack .cl.top -side top -fill both
+#	frame .cl.bot -relief raised -bd 1
+#	pack .cl.bot -side bottom -fill both
+#	set map "$BinDir/etc/wafertowafer.gif"
+#	set im [image create photo -file $map]
+#	label .cl.top.image -image $im
+#	pack .cl.top.image -side left -padx 5m -pady 5m
+#	button .cl.bot.button -text EXIT -command {destroy .cl}
+#	pack .cl.bot.button -side left -expand 1 \
+		-padx 5m -pady 5m -ipadx 2m -ipady 1m
+
+#	WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "Counter_Lock: \$Info(move_now) is $Info(move_now)"
+#	tkwait visibility .cl.bot
+#	focus -force .cl.bot.button
+#	grab set -global .cl.bot
+#	after 1000 RaiseWindow .cl
+#	
+	
+	#comment end.
+	
+	#################################
+	after 10000
+	PutsDebug "send WTWTesting to EMS start"			
+	set Info(AlarmTime) 0
+	set comments "WTWTesting"
+	set msg [Generate_EPR_Msg  "Productive" "$promisname \"\" \"\" true" "" "EQUIP_START" "\"SUBSTATE Running \" \"LOT_ID  $Info(LotID) \" \"DEVICE_ID $Info(Device)  \" \"REPROBE $Info(isReprobe)  \" \"COMMENTS $comments \" \"OPERATOR_ID $Info(OperID)  \" \"PROBECARD_ID $Info(PCID)  \" \"PROBECARD_TYPE $Info(PCType) \" \"WAFER_ID $Info(Wafer) \" \"PASS  $Info(Sort)\" " " \"ALARM_TIME $Info(AlarmTime) \" "]
+	Msg_To_TTT $msg
+	PutsDebug "send WTWTesting to EMS complete"
+	WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "Counter_Lock,send WTWTesting to EMS complete"
+	##################################
+	
+	set wFlag 1
+	set w2w_minutes [expr [expr {int($Info(PauseSoak))}] / 60]
+	set w2w_tempMinutes $w2w_minutes
+	set w2w_seconds [expr [expr {int($Info(PauseSoak))}] % 60]
+	set option "wafer2waferSoak"
+	toplevel .wclock
+	wm overrideredirect .wclock true
+	set sizes [wm maxsize .wclock]
+	set x [expr {[lindex $sizes 0]/2 - 275}]
+	set y [expr {[lindex $sizes 1]/2 - 170}]
+	wm geometry .wclock "600x480+${x}+${y}"
+	label .wclock.l -height 2 -bg pink -fg black -bd 10 -relief raised -font {times 100 bold} -text $w2w_minutes
+	set map "$BinDir/etc_pic_$Info(Type)/cancel.gif"
+	set im [image create photo -file $map]
+#	button .wclock.stop  -command "Cancel $option" -bg pink -bd 5 -image $im
+	pack .wclock.l -expand yes -fill both
+#	pack .wclock.stop -side bottom -expand yes -fill both
+	tkwait visibility .wclock
+	focus -force  .wclock
+	grab set -global .wclock
+#	set time_tmp [TIME_STAMPt]
+	WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "Trigger: .wclock create complete and lock the screen now."
+	after 1000 RaiseWindow .wclock
+	wtick $station $option
+	
+			
+}
+
+###############################################################
+# End Of Wafer
+###############################################################
+proc EndOfWafer {station wafer_id cassette slot num_pass num_tested start_time end_time lot_id} {
+	global Info .dlg1 .dlg2 Debug_Flag LogDir
+
+	set Info(Cancel) 1
+	if { [ winfo exists .dlg1 ] } {
+		grab release .dlg1
+		destroy .dlg1
+	}
+	if { [ winfo exists .dlg2 ] } {
+		grab release .dlg2
+		destroy .dlg2
+	}
+#	set time_tmp [TIME_STAMPt]
+	WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "EndOfWafer: WaferID $Info(WaferID) completed."
+}
+
+###############################################################
+# get wafer center , get all parameter for this device here.
+###############################################################
+proc LayoutHeader { station xmin xmax ymin ymax } {
+
+	global Info SetupFlag Debug_Flag LogDir BinDir Clock_Info special_flag
+
+	set Info(XCenter)  [ expr ($xmin + $xmax) / 2 ]
+	set Info(YCenter) [ expr ($ymin + $ymax) / 2 ]
+
+	if { [ string compare $Info(Device) "NON" ] != 0  && [ string compare $Info(Device) "NON140" ] != 0 } {
+		if {$Info(WriteLog4GetWaferCenter) == 0} {
+			WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: running find_moo $BinDir/etc/find_moo $Info(Device) $Info(LotID) $Clock_Info "
+		}
+		if [ catch {set MOO [eval exec "$BinDir/etc/find_moo $Info(Device) $Info(LotID) $Clock_Info"]} err] {
+
+			set context "Error finding setup in $Clock_Info for $Info(Device) $Info(LotID) , $err "
+			if {$Info(WriteLog4GetWaferCenter) == 0} {
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)"  "LayoutHeader: $context"
+			}
+			showabortlot "SUN System Error" "System" $station
+			
+		} else {
+			if {$Info(WriteLog4GetWaferCenter) == 0} {
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: Choosen Device: $MOO"
+			}
+			if { [ string compare $MOO "NONE" ] == 0 } {
+
+			} else {
+
+				set handle [open "$Clock_Info"]
+				inf iconfig
+				iconfig load $handle
+				close $handle
+				if [catch { set isetup [iconfig blocks -unique $MOO] } err] {
+
+					WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader:  Error: $err for $Info(Device) : $Info(LotID) : $Info(Sort) "
+					evr send abortlot 0
+					evr send reset 0
+					tk_dialog .oops "Hot Chunck Confirm" "Error: invalid configuration file format" warning 0 "OK"
+				} else {
+
+					if [ catch { set Info(MonitorHWafer) [$isetup data -unique -noerror MonitorHourOnWafer ] } ] {
+						if {$Info(WriteLog4GetWaferCenter) == 0} {
+							WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: MonitorHourOnWafer for $Info(Device): $Info(LotID) : $Info(Sort)"
+						}
+					} else {
+						if {$Info(WriteLog4GetWaferCenter) == 0} {
+							WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: MonitorHourOnWafer for $Info(Device) :$Info(LotID) : $Info(Sort):$Info(MonitorHWafer)"
+						}
+					}
+
+					# Read in sort number block
+					if [ catch { set isort [$isetup blocks -unique -noerror sort_$Info(Sort) ] } err ] {
+						WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: read sort_$Info(Sort) fail, $err"
+						evr send abortlot 0
+						evr send reset 0
+						tk_dialog .oops "Hot Chunck Confirm" "Error: invalid configuration file format" warning 0 "OK"
+					} else {
+						if { $isort != "" } {
+							set Info(isDefaultConfig) 0
+							if [ catch { set Info(CPLEClass) [$isort data -unique -noerror CPLEClass ] } ] {
+								if {$Info(WriteLog4GetWaferCenter) == 0} {
+									WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: CPLEClass for $Info(Device): $Info(LotID) : $Info(Sort) , null"
+								}
+							} else {
+								if {$Info(WriteLog4GetWaferCenter) == 0} {
+									WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: CPLEClass for $Info(Device) :$Info(LotID) : $Info(Sort) : $Info(CPLEClass)"
+								}
+							}
+							if [ catch { set Info(SAFDE) [$isort data -unique -noerror SAFDE ] } ] {
+								if {$Info(WriteLog4GetWaferCenter) == 0} {
+								# set SAFDE default to yes
+									set Info(SAFDE) "yes"
+									WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: SAFDE for $Info(Device): $Info(LotID) : $Info(Sort) , null"
+								}
+							} else {
+								# set SAFDE default to yes
+								if [string equal $Info(SAFDE) ""] {
+									set Info(SAFDE) "yes"
+								}
+							
+								if {$Info(WriteLog4GetWaferCenter) == 0} {
+									WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: SAFDE for $Info(Device) :$Info(LotID) : $Info(Sort) : $Info(SAFDE)"
+								}
+							}
+							if [catch { set Info(RecoverTimer) [$isort data -unique -noerror RecoverTimer ] } err ] {
+								if {$Info(WriteLog4GetWaferCenter) == 0} {
+									WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: RecoverTimer for $err $Info(Device): $Info(LotID) : $Info(Sort) "
+								}
+							} else {
+								if {$Info(WriteLog4GetWaferCenter) == 0} {
+									WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: RecoverTimer for $Info(Device) : $Info(LotID) : $Info(Sort) : $Info(RecoverTimer) "
+								}
+							}
+
+							if [catch { set Info(SoakTimer) [$isort data -unique -noerror SoakTimer ] } ] {
+								if {$Info(WriteLog4GetWaferCenter) == 0} {
+									WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: SoakTimer for $Info(Device) :$Info(LotID) : $Info(Sort) "
+								}
+							} else {
+								if {$Info(WriteLog4GetWaferCenter) == 0} {
+									WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: SoakTimer for $Info(Device) :$Info(LotID) : $Info(Sort) : $Info(SoakTimer) "
+								}
+							}
+
+							#comment by Jiang 20150625, only get from navigator
+#							if [ catch { set Info(Type) [$isort data -unique -noerror Type ] } ] {
+#								if {$Info(WriteLog4GetWaferCenter) == 0} {
+#									WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: Type for $Info(Device) : $Info(LotID) : $Info(Sort) "
+#								}
+#							} else {
+#								if { [ string compare $Info(Type) "Hot" ] == 0 } {
+# maybe could add one more variable here to finallize the part for this pass is Hot or not  ----- 20140108 -By Jiang Nan
+#									set SetupFlag 1
+#									if {$Info(WriteLog4GetWaferCenter) == 0} {
+#										WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: Type for $Info(Device) : $Info(LotID) : $Info(Sort) : $Info(Type) "
+#									}
+#								}
+#							}
+
+							# comment temperature by JiangNan 20150625, only get from navigator
+#							if [ catch { set Info(Temperature) [$isort data -unique -noerror Temperature ] } ] {
+#								if {$Info(WriteLog4GetWaferCenter) == 0} {
+#									WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: Temperature for $Info(Device): $Info(LotID) : $Info(Sort) "
+#								}
+#							} else {
+#								if {$Info(WriteLog4GetWaferCenter) == 0} {
+#									WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: Temperature for $Info(Device) :$Info(LotID) : $Info(Sort) : $Info(Temperature) "
+#								}
+#							}
+
+							if [ catch { set Info(PIB) [$isort data -unique -noerror PIB ] } ] {
+								if {$Info(WriteLog4GetWaferCenter) == 0} {
+									WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: PIB for $Info(Device): $Info(LotID) : $Info(Sort) "
+								}
+							} else {
+								if {$Info(WriteLog4GetWaferCenter) == 0} {
+									WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: PIB for $Info(Device) :$Info(LotID) : $Info(Sort) : $Info(PIB) "
+								}
+							}
+							############update by fengsheng for add Alignment to config file############
+							if [ catch { set Info(AlignmentAlarm) [$isort data -unique -noerror AlignmentAlarm ] } ] {
+								if {$Info(WriteLog4GetWaferCenter) == 0} {
+									WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: AlignmentAlarm for $Info(Device): $Info(LotID) : $Info(Sort)"
+								}
+							} else {
+								if {$Info(WriteLog4GetWaferCenter) == 0} {
+									WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: AlignmentAlarm for $Info(Device) :$Info(LotID) : $Info(Sort):$Info(AlignmentAlarm)"
+								}
+							}
+
+							if [ catch { set Info(AlignmentLimit) [$isort data -unique -noerror AlignmentLimit ] } ] {
+								if {$Info(WriteLog4GetWaferCenter) == 0} {
+									WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: AlignmentLimit Limit1 for $Info(Device): $Info(LotID) : $Info(Sort)"
+								}
+							} else {
+								if {$Info(WriteLog4GetWaferCenter) == 0} {
+									WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: AlignmentLimit Limit2 for $Info(Device) :$Info(LotID) : $Info(Sort):$Info(AlignmentLimit)"
+								}
+							}
+							##########Alignment logic end ########################################
+
+							if [ catch { set Info(ShortTerm) [$isort data -unique -noerror ShortTerm ] } ] {
+								if {$Info(WriteLog4GetWaferCenter) == 0} {
+								WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: ShortTerm for $Info(Device): $Info(LotID) : $Info(Sort) "
+								}
+							} else {
+								if {$Info(WriteLog4GetWaferCenter) == 0} {
+									WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: ShortTerm for $Info(Device) :$Info(LotID) : $Info(Sort) : $Info(ShortTerm) "
+								}
+							}
+							#### Add NoBake point by fengsheng #######
+							if [ catch { set Info(NoBake) [$isort data -unique -noerror NoBake ] } ] {	
+								if {$Info(WriteLog4GetWaferCenter) == 0} {
+									WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: NoBake for $Info(Device): $Info(LotID) : $Info(Sort) "				
+								}					
+							} else {
+								if {$Info(WriteLog4GetWaferCenter) == 0} {
+									WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: NoBake for $Info(Device) :$Info(LotID) : $Info(Sort) : $Info(NoBake) "				
+								} 
+							}				
+							PutsDebug "Info(NoBake)=$Info(NoBake)"
+							#### Add ShortBake point by fengsheng######					
+							if [ catch { set Info(ShortBake) [$isort data -unique -noerror ShortBake ] } ] {
+								if {$Info(WriteLog4GetWaferCenter) == 0} {		
+								WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: ShortBake for $Info(Device): $Info(LotID) : $Info(Sort) "						
+								}			
+							} else {
+								if {$Info(WriteLog4GetWaferCenter) == 0} {		
+									WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: ShortBake for $Info(Device) :$Info(LotID) : $Info(Sort) : $Info(ShortBake) "
+									}					
+							}
+							if { $Info(ShortBake) == "" } {
+								set Info(ShortBake) 1800
+								PutsDebug "ShortBake use Default:1800"
+							}
+							PutsDebug "Info(ShortBake)=$Info(ShortBake)"
+							if { $Info(NoBake) == "" } {
+								set Info(NoBake) 0
+								PutsDebug "NoBake is ShortBake:$Info(ShortBake)"
+							}
+							PutsDebug "Info(NoBake)=$Info(NoBake)"
+														
+							if [ catch { set Info(die2die) [$isort data -unique -noerror Die2Die ] } ] {
+								if {$Info(WriteLog4GetWaferCenter) == 0} {
+									WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: Die2Die for $Info(Device): $Info(LotID) : $Info(Sort) "
+								}
+							} else {
+								if {$Info(WriteLog4GetWaferCenter) == 0} {
+									WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: Die2Die for $Info(Device) :$Info(LotID) : $Info(Sort) : $Info(die2die) "
+								}
+							}
+							if { $Info(die2die) == "" || [string compare $Info(die2die) "Auto"] == 0 } {
+								set Info(die2die) "Auto"
+								set Info(d2d_flag) 0
+							}
+							if { [string compare $Info(die2die) "Manual"] == 0 } {
+								set Info(d2d_flag) 1
+							}
+							PutsDebug "Info(die2die)=$Info(die2die)"
+
+							if [ catch { set Info(Center) [$isort data -unique -noerror Center ] } ] {
+								if {$Info(WriteLog4GetWaferCenter) == 0} {
+									WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: Center for $Info(Device): $Info(LotID) : $Info(Sort) "
+								}
+							} else {
+								if {$Info(WriteLog4GetWaferCenter) == 0} {
+									WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: Center for $Info(Device) :$Info(LotID) : $Info(Sort) : $Info(Center) "
+								}
+							}
+							
+							if [ catch { set Info(PauseSoak) [$isort data -unique -noerror PauseSoak ] } ] {
+								if {$Info(WriteLog4GetWaferCenter) == 0} {
+									WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: PauseSoak for $Info(Device): $Info(LotID) : $Info(Sort) :$Info(PauseSoak) "
+								}
+							} else {
+								if {$Info(WriteLog4GetWaferCenter) == 0} {
+									WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: PauseSoak for $Info(Device) :$Info(LotID) : $Info(Sort) : $Info(PauseSoak) "
+								}
+							}
+							
+							if [ catch { set Info(D2D_IntervalMax) [$isort data -unique -noerror D2D_IntervalMax ] } ] {
+								if {$Info(WriteLog4GetWaferCenter) == 0} {
+									WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: D2D_IntervalMax for $Info(Device): $Info(LotID) : $Info(Sort) "
+								}
+							} else {
+								if {$Info(WriteLog4GetWaferCenter) == 0} {
+									WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: D2D_IntervalMax for $Info(Device) :$Info(LotID) : $Info(Sort) : $Info(D2D_IntervalMax) "
+								}
+							}
+							
+							if [ catch { set Info(D2D_IntervalMin) [$isort data -unique -noerror D2D_IntervalMin ] } ] {
+								if {$Info(WriteLog4GetWaferCenter) == 0} {
+									WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: D2D_IntervalMin for $Info(Device): $Info(LotID) : $Info(Sort) "
+								}
+							} else {
+								if {$Info(WriteLog4GetWaferCenter) == 0} {
+									WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: D2D_IntervalMin for $Info(Device) :$Info(LotID) : $Info(Sort) : $Info(D2D_IntervalMin) "
+								}
+								# default IntervalMin set to IntervalMax
+								if { [string equal $Info(D2D_IntervalMin) ""] } {
+									set Info(D2D_IntervalMin) $Info(D2D_IntervalMax)
+								}
+							}
+							
+							if [ catch { set Info(D2D_SoakMax) [$isort data -unique -noerror D2D_SoakMax ] } ] {
+								if {$Info(WriteLog4GetWaferCenter) == 0} {
+									WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: D2D_SoakMax for $Info(Device): $Info(LotID) : $Info(Sort) "
+								}
+							} else {
+								if {$Info(WriteLog4GetWaferCenter) == 0} {
+									WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: D2D_SoakMax for $Info(Device) :$Info(LotID) : $Info(Sort) : $Info(D2D_SoakMax) "
+								}
+								if { [string equal $Info(D2D_SoakMax) ""] } {
+									set Info(D2D_SoakMax) 0
+								}
+							}
+							if [ catch { set Info(D2D_SoakMin) [$isort data -unique -noerror D2D_SoakMin ] } ] {
+								if {$Info(WriteLog4GetWaferCenter) == 0} {
+									WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: D2D_SoakMin for $Info(Device): $Info(LotID) : $Info(Sort) "
+								}
+							} else {
+								if {$Info(WriteLog4GetWaferCenter) == 0} {
+									WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: D2D_SoakMin for $Info(Device) :$Info(LotID) : $Info(Sort) : $Info(D2D_SoakMin) "
+								}
+								if { [string equal $Info(D2D_SoakMin) ""] } {
+									set Info(D2D_SoakMin) 0
+								}
+							}
+
+
+						} else {
+							if {$Info(WriteLog4GetWaferCenter) == 0} {
+								WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: isort is null for $Info(Device) :$Info(LotID) : $Info(Sort) "
+							}
+						}
+						
+						
+						if { $Info(D2D_IntervalMax) < $Info(D2D_IntervalMin) || $Info(D2D_SoakMax) < $Info(D2D_SoakMin) } {
+							showabortlot "D2D Parameter Error" "D2D" $station
+							set category "D2D"
+							set cmd "$BinDir/SendMail.pl $Info(Device) $Info(LotID) $Info(Sort) $category $Info(HOST)"
+							if { [catch {set sendmail [eval exec "$cmd" ]} err] } {
+								WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: SendMail ERROR when executing $cmd : $err"
+							} 
+							puts "$Info(D2D_IntervalMax) < $Info(D2D_IntervalMin) || $Info(D2D_SoakMax) < $Info(D2D_SoakMin)"
+							
+							
+						}
+					}
+				}
+			}
+		}
+	}
+	
+	if { [string equal $Info(Center) ""] } {
+		set Info(Center) "$Info(XCenter),$Info(YCenter)"
+		WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: Setting Center as Navigator X,Y length for $Info(Device) :$Info(LotID) : $Info(Sort) : $Info(Center) "
+	}
+	if { [string equal $Info(Center) ""] } {
+		if { [string compare $Info(PauseSoak) ""] != 0 || [string compare $Info(D2D_IntervalMax) ""] != 0} {
+			showabortlot "Center Parameter Error" "Center" $station
+			set category "Center"
+			set cmd "$BinDir/SendMail.pl $Info(Device) $Info(LotID) $Info(Sort) $category $Info(HOST)"
+			if { [catch {set sendmail [eval exec "$cmd"]} err] } {
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "LayoutHeader: SendMail ERROR when executing $cmd : $err"
+			} 
+		}
+	}
+
+# flag for write log
+	set Info(WriteLog4GetWaferCenter) 1
+	
+}
+
+proc Special_Soak_Dialog { station } {
+	global BinDir Stationnum LogDir Info special_comments
+	set Stationnum $station
+	set special_comments ""
+	WriteFile "$LogDir/clock/clock.out.$Info(HOST)"  "Special_Soak_Dialog: Special_Soak_Dialog window pop-up"
+	toplevel .special
+	wm title .special "Special Soak"
+	wm iconname .special Dialog
+	frame .special.top -relief raised -bd 1
+	pack .special.top -side top -fill both
+	frame .special.bot -relief raised -bd 1
+	pack .special.bot -side bottom -fill both
+	set map "$BinDir/etc_pic_$Info(Type)/special_heatup.gif"
+	set im [image create photo -file $map]
+	label .special.top.image -image $im
+	pack .special.top.image -side left -padx 5m -pady 5m
+	
+	frame .special.rows
+    label .special.rows.l0 -text "Comments:" -anchor e
+    entry .special.rows.e0 -textvariable special_comments -width 15
+    grid  .special.rows.l0 .special.rows.e0 -padx 6 -pady 4
+	pack  .special.rows -side top
+	
+	button .special.bot.button -text OK -command {
+		if [winfo exists .special] {
+			grab release .special
+		}
+		if { [string compare $special_comments ""] == 0 } {	
+			tk_dialog .warning "Alignment input check" "Please verify the inputting" warning 0 "OK"	
+			return	
+			}
+		if [catch { set USER_AUTH [eval exec "$BinDir/etc/login_screen"] } err ] {
+			WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "Special: error exec $BinDir/etc/login_screen, error code: $err "
+			return 0
+			} else {
+				while { [string last "fail" $USER_AUTH] >= 0 } {
+					WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "Special: user login fail"
+					set USER_AUTH [eval exec "$BinDir/etc/login_screen" ]
+				}
+			}
+		PutsDebug "special_comments:$special_comments,User:$USER_AUTH"
+		WriteFile "$LogDir/clock/clock.out.$Info(HOST)"  "special_comments:$special_comments,User:$USER_AUTH,Click OK!"
+		TemperatureChange $Stationnum soak
+		destroy .special
+		return
+	}
+	pack .special.bot.button -side left -expand 1 \
+		-padx 5m -pady 5m -ipadx 2m -ipady 1m
+	button .special.bot.button1 -text Cancel -command {
+		WriteFile "$LogDir/clock/clock.out.$Info(HOST)"  "Special_Soak_Dialog: Click Cancel!"
+
+		if { $Info(ShortTerm) != "" } {	
+			if { $Info(NoBake) <= $Info(ShortBake)} {
+				if { $Info(NoBake) == $Info(ShortBake)} {
+					WriteFile "$LogDir/clock/clock.out.$Info(HOST)"  "Special_Soak_Dialog:ShortTerm is configured,NoBake:$Info(NoBake)==ShortBake:$Info(ShortBake),Action:ShortBake"
+					set Info(SoakTimer) $Info(ShortTerm)
+					set Info(flag_ShortTerm) 1
+					TemperatureChange $Stationnum soak
+					destroy .special	
+					return
+				} else {
+					WriteFile "$LogDir/clock/clock.out.$Info(HOST)"  "Special_Soak_Dialog:NoBake:$Info(NoBake)<ShortBake:$Info(ShortBake)"
+					set Interval [ expr [ eval exec "$BinDir/etc/sys_time -s" ] - $Info(LastEndTime)]	
+					if { $Interval <= $Info(ShortBake)} {		
+						if { $Interval < $Info(NoBake)} {	
+							WriteFile "$LogDir/clock/clock.out.$Info(HOST)"  "Special_Soak_Dialog:Interval:$Interval <=NoBake:$Info(NoBake),Action:NoBake"					
+							destroy .special	
+							return
+						} else {
+							if { $Interval >= $Info(NoBake) && $Interval <= $Info(ShortBake)} {
+								WriteFile "$LogDir/clock/clock.out.$Info(HOST)"  "Special_Soak_Dialog:ShortTerm is configured,NoBake:$Info(NoBake)<Interval:$Interval<ShortBake:$Info(ShortBake),Action:ShortBake"
+								set Info(SoakTimer) $Info(ShortTerm)
+								set Info(flag_ShortTerm) 1
+								TemperatureChange $Stationnum soak
+								destroy .special	
+								return
+							}
+						}		
+					} else {	
+						WriteFile "$LogDir/clock/clock.out.$Info(HOST)"  "Special_Soak_Dialog:Interval:$Interval>ShortBake:$Info(ShortBake),LongBake"
+						TemperatureChange $Stationnum soak
+						destroy .special	
+						return
+					}
+				} 
+			} else {
+				if { [ winfo exists .noshort ] } {
+						destroy .noshort
+					}
+				destroy .special
+				evr send pause $Stationnum
+				#set ans [tk_dialog .test "1" "trest" "" 0 "OK"]
+				after 2000
+				#evr send abortlot -discard $Stationnum
+				evr send reset -discard  $Stationnum
+			
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)"  "Special_Soak_Dialog:NoBake:$Info(NoBake)>ShortBake:$Info(ShortBake),Action:Abort LOT!"
+				toplevel .noshort
+				wm geometry .noshort "-600-200"
+				wm title .noshort "noshort Soak"
+				wm iconname .noshort Dialog		
+				frame .noshort.top -relief raised -bd 1
+				pack .noshort.top -side top -fill both	
+				frame .noshort.bot -relief raised -bd 1
+				pack .noshort.bot -side bottom -fill both
+				set map "$BinDir/etc_pic_$Info(Type)/noshort.gif"
+				set im [image create photo -file $map]		
+				label .noshort.top.image -image $im
+				pack .noshort.top.image -side left -padx 5m -pady 5m
+				button .noshort.bot.button -text OK -command {
+					destroy .noshort	
+					return
+				}
+				pack .noshort.bot.button -side left -expand 1 \
+				-padx 5m -pady 5m -ipadx 2m -ipady 1m
+							
+			}
+		} else {
+				  if { $Info(NoBake) == 0 || $Info(NoBake) == "" } {
+						set temp_nobake 1800
+					} else {
+					   set temp_nobake  $Info(NoBake)
+					}
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)"  "Special_Soak_Dialog:ShortTerm Null,temp_nobake:$temp_nobake"
+			    set Interval [ expr [ eval exec "$BinDir/etc/sys_time -s" ] - $Info(LastEndTime)]
+				   if { $Interval > $temp_nobake } {
+						WriteFile "$LogDir/clock/clock.out.$Info(HOST)"  "Special_Soak_Dialog:ShortTerm Null,Interval:$Interval>temp_nobake:$temp_nobake,Action:LongBake"
+						TemperatureChange $Stationnum soak
+						destroy .special	
+						return
+					} else {
+						WriteFile "$LogDir/clock/clock.out.$Info(HOST)"  "Special_Soak_Dialog:ShortTerm Null,Interval:$Interval<=temp_nobake:$temp_nobake,Action:NoBake"
+						destroy .special
+						return
+					}
+				
+		}
+	}
+	pack .special.bot.button1 -side right -expand 1 \
+		-padx 10m -pady 5m -ipadx 2m -ipady 1m
+	tkwait visibility .special
+    	grab set -global .special
+	after 1000 RaiseWindow .special
+}
+
+###############################################################
+# Start of lot to decide cooldown
+###############################################################
+proc ProbeCardDefine { station card_id card_type dib_id dib_type args } {
+	global Info lastlogfile ReadList BinDir temperaturechange_flag probertype special_flag LogDir recoverdonefile
+	PutsDebug "card_id=$card_id,dib_id=$dib_id"
+	#WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "ProbeCardDefine: dib_id=$dib_id"
+	set Info(PCID) [ string tolower $card_id ]
+	set Info(PBID) [ string tolower $dib_id ]
+	PutsDebug "Info(PCID)=$Info(PCID),Info(PBID)=$Info(PBID)"
+	set time_tmp [TIME_STAMPt]
+	WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "ProbeCardDefine: trigger, type:$Info(Type),temperature:$Info(Temperature), lastlog: $lastlogfile, recoverlog: $recoverdonefile"
+	
+	
+
+#example $lastlogfile:
+	
+#P52L45N
+#DE35626.1N
+#3
+#normal
+#7551-01
+#unknown
+#0
+#1379034806
+#120
+
+	ReadFile $lastlogfile "last"
+	set Info(LastDeviceName) [ lindex $ReadList 0]
+	set Info(LastLotID) [ lindex $ReadList 1]
+	set Info(LastSortID) [ lindex $ReadList 2]
+	set Info(LastTempType) [ lindex $ReadList 3]
+	set Info(LastProbeCardID) [ lindex $ReadList 4]
+	set Info(LastProbeBoardID) [ lindex $ReadList 5]
+	set Info(LastProbeTemp) [ lindex $ReadList 6]
+	set Info(LastEndTime) [ lindex $ReadList 7]
+	set Info(LastRecoverTimer) [ lindex $ReadList 8]
+
+	
+	ReadFile $recoverdonefile "recover"
+	set recoveroption [ lindex $ReadList 0]
+	set recovertype [ lindex $ReadList 1]
+
+	if { [ string compare [ string tolower $Info(Type) ] "hot" ] == 0  || [ string compare [ string tolower $Info(Type) ] "cold" ] == 0} {
+		if { [ string compare [ string tolower $Info(LastTempType) ] [ string tolower $Info(Type) ] ] == 0 } {
+			if { $Info(LastProbeTemp) == $Info(Temperature) } {
+				if { [ string compare $Info(LastProbeCardID) $Info(PCID) ] == 0 } {
+					if { [ string compare $Info(LastProbeBoardID) $Info(PBID) ] != 0  && [ string compare [ string tolower $Info(PIB) ] "yes" ] == 0 } {
+						WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "ProbeCardDefine: LastProbeBoardID = $Info(LastProbeBoardID), PBIB = $Info(PBID), PIB = $Info(PIB), soak"
+						TemperatureChange $station soak
+					} else {
+						set Interval [ expr [ eval exec "$BinDir/etc/sys_time -s" ] - $Info(LastEndTime) ]
+						if { $Interval > $Info(ShortBake) } {
+							WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "ProbeCardDefine: Interval $Interval > $Info(ShortBake) soak"
+							TemperatureChange $station soak
+						} else {
+							WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "ProbeCardDefine: Interval $Interval < $Info(ShortBake) Special_Soak_Dialog window"
+							Special_Soak_Dialog $station
+						}
+					}
+				} else {
+#					puts " heatup for the Probe card change,LastProbeCardID is $Info(LastProbeCardID), PCID is $Info(PCID)"
+					WriteFile "$LogDir/clock/clock.out.$Info(HOST)"  "ProbeCardDefine: Probe card change,LastProbeCardID is $Info(LastProbeCardID), PCID is $Info(PCID), soak"
+					TemperatureChange $station soak
+				}
+			} else {
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)"  "ProbeCardDefine: Type $Info(LastTempType) to $Info(Type), lastProbeTemp is $Info(LastProbeTemp), Temperature is $Info(Temperature), soak."
+				TemperatureChange $station soak
+			}
+		} else {
+			if { [ string compare [ string tolower $Info(LastTempType) ] "" ] == 0 || [ string compare [ string tolower $Info(LastTempType) ] "room" ] == 0 } {
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)"  "ProbeCardDefine: LastTempType is $Info(LastTempType) , now is $Info(Type), soak"
+				TemperatureChange $station soak
+			} else {
+				if { [ string compare [ string tolower $recoveroption ] "thirty" ] == 0 } {
+					WriteFile "$LogDir/clock/clock.out.$Info(HOST)"  "ProbeCardDefine: LastTempType is $Info(LastTempType) , now is $Info(Type), thirty done, soak"
+					TemperatureChange $station soak
+				} else {
+					set Info(AbortLot) 1
+					WriteFile "$LogDir/clock/clock.out.$Info(HOST)"  "ProbeCardDefine: LastTempType is $Info(LastTempType) , now is $Info(Type), nothirty, abortlot"
+					showabortlot "30min Not Complete" "thirty" $station
+				}
+			}
+		}
+	} else {
+		if { [ string compare [ string tolower $Info(LastTempType) ] "hot" ] == 0  || [ string compare [ string tolower $Info(LastTempType) ] "cold" ] == 0} {
+			if { [ string compare [ string tolower $recoveroption ] "recover" ] != 0 } {
+				set Info(AbortLot) 1
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)"  "ProbeCardDefine: LastTempType is $Info(LastTempType) , now is $Info(Type), norecover, abortlot"
+				showabortlot "Recover Not Complete" "recover" $station
+			}
+		}	
+	}
+	if { $Info(AbortLot) == 0 } {
+		set cmd_last "rm $lastlogfile"
+		catch { eval exec $cmd_last }
+		set cmd_recover "rm $recoverdonefile"
+		catch { eval exec $cmd_recover }
+	    WriteFile "$LogDir/clock/clock.out.$Info(HOST)"  "ProbeCardDefine: remove lastlogfile, recoverdonefile"
+	}
+
+	# combine logic with StartOfWafer, all platform check hotchuck logic in ProbeCardDefine
+}
+
+###############################################################
+# Start of wafer to decide heatup
+###############################################################
+proc StartOfWafer { station } {
+
+
+	global Info lastlogfile SetupFlag ReadList BinDir FirstWafer temperaturechange_flag probertype SetupFlag LogDir CPLE_First_Wafer_Time_Start
+
+#	set time_tmp [TIME_STAMPt]
+	WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "StartOfWafer: WaferID $Info(WaferID), MonitorHWafer is $Info(MonitorHWafer)."
+	
+	if { $SetupFlag == 1 && $Info(MonitorHWafer) != "" } {
+		read_inf
+
+		set Info(T2_start) [ clock seconds ]
+
+		set wafer_num [ string range $Info(WaferID) 2 end ]
+		set MonitorSecond [ expr $Info(MonitorHWafer) * 3600 ]
+		if {  $Info(T1)  > $MonitorSecond } {
+			set Info(ThanSixH_${wafer_num}) 1
+#? why jump wafer#1?
+			if { $Info(WaferCount) != 1 } {
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)"  "StartOfWafer: test time over limit $MonitorSecond abort wafer then continue "
+				evr send pause $station
+				after 1000
+				evr send abortwafer $station
+				evr send start $station
+			}
+		}
+	}
+# only P8 exists on floor, move ltx sat platform from SOW to probecarddefine function -- 20151020
+	
+}
+
+proc TemperatureChange { station option } {
+
+	global Info minutes BinDir pic temperaturechange_flag probertype LogDir 
+	WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "TemperatureChange $option,Info(SoakTimer)=$Info(SoakTimer),Info(isDefaultConfig)=$Info(isDefaultConfig)"
+	after 2000
+	PutsDebug "proc_TemperatureChange,the Info(SoakTimer)=$Info(SoakTimer)"
+	if { [ string compare $option "soak" ] == 0 } {
+		set title {Remind Soak}
+# add by Jiang for CPLE alarm pic
+		if {[string compare [string tolower $Info(CPLEClass) ] "yes"] == 0 } {
+				set map "$BinDir/etc_pic_hot/CPLE_heatup.gif"
+			} else {
+				if {$Info(isDefaultConfig) == 1} {
+					set map "$BinDir/etc_pic_$Info(Type)/Default_soak.gif"
+				} else {
+					set map "$BinDir/etc_pic_$Info(Type)/soak.gif"
+				}
+			}	
+# switch end
+	} elseif { [ string compare $option "recover" ] == 0 } {
+		set title {Remind Recover}
+		if { $Info(AbortLot) == 0 } {
+			set map "$BinDir/etc_pic_$Info(Type)/recover.gif" 
+		} else {
+			set map "$BinDir/etc_pic_$Info(LastTempType)/recover.gif" 
+		}
+	} elseif { [ string compare $option "thirty" ] == 0 } {
+		set title {Remind 30 Minutes}
+		if { $Info(AbortLot) == 0 } {
+			set map "$BinDir/etc_pic_$Info(Type)/thirty.gif" 
+		} else {
+			set map "$BinDir/etc_pic_$Info(LastTempType)/thirty.gif" 
+		}
+	}
+
+	set pic [toplevel .ws -class Dialog]
+	wm title .ws $title
+	wm iconname .ws Dialog
+	frame .ws.top -relief raised -bd 1
+	pack .ws.top -side top -fill both
+	frame .ws.bot -relief raised -bd 1
+	pack .ws.bot -side bottom -fill both
+	set im [image create photo -file $map]
+	label .ws.top.image -image $im
+	pack .ws.top.image -side left -padx 5m -pady 5m
+	button .ws.bot.button -text OK -command "Trigger $option"
+	pack .ws.bot.button -side left -expand 1 \
+		-padx 5m -pady 5m -ipadx 2m -ipady 1m
+	tkwait visibility .ws.bot
+	focus -force .ws.bot.button
+	grab set -global .ws.bot
+#	set time_tmp [TIME_STAMPt]
+	WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "TemperatureChange $option, UI create finish, lock screen"
+	after 1000 RaiseWindow .ws
+	#######update by fengsheng##########
+
+}
+
+proc RaiseWindow { dialog } {
+	global LogDir Info
+	if [ winfo exists $dialog ] {
+		raise $dialog
+		after 20000 RaiseWindow $dialog
+	}
+}
+
+######################################################
+##GreaterSix_Diag
+######################################################
+
+proc GreaterHour_Diag {} {
+
+	global Info BinDir LogDir
+	set title {Hold the wafers to PE}
+	toplevel .wi -class Dialog
+	wm title .wi $title
+	wm iconname .wi Dialog
+
+	frame .wi.top -relief raised -bd 1
+	pack .wi.top -side top -fill both
+	frame .wi.bot -relief raised -bd 1
+	pack .wi.bot -side bottom -fill both
+	set map "$BinDir/etc/wafertohold.gif"
+	set im [image create photo -file $map]
+	label .wi.top.image -image $im
+	label .wi.top.l -text " wafers:  $Info(r_wafer_list) "
+	pack .wi.top.image -side left -padx 5m -pady 5m
+	pack .wi.top.l -side left -padx 5m -pady 5m
+	button .wi.bot.button -text OK -command {destroy .wi}
+	pack .wi.bot.button -side left -expand 1 \
+		-padx 5m -pady 5m -ipadx 2m -ipady 1m
+
+}
+
+
+######################################################
+# Trigger clock
+######################################################
+
+proc Trigger { option } {
+
+	global minutes
+	global seconds
+	global Info BinDir
+	global pic
+	global Flag
+	global temperaturechange_flag
+	global first_dts LogDir
+	destroy $pic
+	set Flag 1
+	set seconds 0
+	set temperaturechange_flag 1
+	# change bg depends on type
+	if { $Info(AbortLot) == 0 } {
+		if { [ string compare $Info(Type) "hot" ] == 0  } {
+			set clock_bg "red"
+		} elseif { [ string compare $Info(Type) "cold" ] == 0} {
+			set clock_bg "blue"
+		} else {
+			set clock_bg "red"
+		}
+	} else {
+		if { [ string compare $Info(LastTempType) "hot" ] == 0  } {
+			set clock_bg "red"
+		} elseif { [ string compare $Info(LastTempType) "cold" ] == 0} {
+			set clock_bg "blue"
+		} else {
+			set clock_bg "red"
+		}
+	}
+	
+	if { [ string compare $option "soak" ] == 0 } {
+		if { $Info(flag_ShortTerm) == 1} {
+			set minutes $Info(ShortTerm)
+		} else {
+			set minutes $Info(SoakTimer)
+		}
+		PutsDebug "proc_Tirgger soak,the minutes:$Info(flag_ShortTerm)"
+	} elseif { [ string compare $option "recover" ] == 0 } {
+		if { $Info(AbortLot) == 0 } {
+			set minutes $Info(RecoverTimer)
+			PutsDebug "proc_Tirgger recover,the minutes:$Info(RecoverTimer)"
+		} else {
+			set minutes $Info(LastRecoverTimer)
+			PutsDebug "proc_Tirgger recover,the minutes:$Info(LastRecoverTimer)"
+		}
+		
+	} elseif { [ string compare $option "thirty" ] == 0 } {
+		set minutes 30
+		PutsDebug "proc_Tirgger,the minutes:30 after room"
+	} else {
+		set minutes $Info(RecoverTimer)
+	}
+	WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "Trigger: $option begin, minutes = $minutes"
+
+	toplevel .clock
+	wm overrideredirect .clock true
+	set sizes [wm maxsize .clock]
+	set x [expr {[lindex $sizes 0]/2 - 275}]
+	set y [expr {[lindex $sizes 1]/2 - 170}]
+	wm geometry .clock "600x480+${x}+${y}"
+
+	label .clock.l -height 2 -bg $clock_bg -fg black -bd 10 -relief raised -font {times 100 bold} -text $minutes
+	if { $Info(AbortLot) == 0 } {
+		set map "$BinDir/etc_pic_$Info(Type)/cancel.gif"
+	} else {
+		set map "$BinDir/etc_pic_$Info(LastTempType)/cancel.gif"
+	}
+	
+	set im [image create photo -file $map]
+	button .clock.stop  -command "Cancel $option" -bg $clock_bg -bd 5 -image $im
+	pack .clock.l -expand yes -fill both
+	pack .clock.stop -side bottom -expand yes -fill both
+	tkwait visibility .clock
+	focus -force  .clock
+	grab set -global .clock
+#	set time_tmp [TIME_STAMPt]
+	WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "Trigger: .clock create complete and lock the screen now."
+	after 1000 RaiseWindow .clock
+	tick $option
+}
+
+###############################################################
+# Update PMI indicator Color and Wafer Counter
+###############################################################
+proc updatePMIButton {color text} {
+	if { ![winfo exists .buttonMenu.pmi ]} {
+		return
+	}
+	.buttonMenu.pmi configure -bg $color -text $text
+}
+
+#new lot end diag
+proc lotenddiag { } {
+
+	global pic endoflot_flag BinDir LogDir Info
+
+	set endoflot_flag 1
+
+	if { [ winfo exist .we ] } {
+		focus -force .we.bot
+		return
+	}
+
+	set title {Remind Recover Temperature}
+	set pic [toplevel .we -class Dialog]
+	wm geometry .we "-400+300"
+	wm title .we $title
+	wm iconname .we Dialog
+	frame .we.top -relief raised -bd 1
+	pack .we.top -side top -fill both
+	frame .we.bot -relief raised -bd 1
+	pack .we.bot -side bottom -fill both
+	
+	if { $Info(AbortLot) == 0 } {
+		if { [ string compare [ string tolower $Info(Type) ] "cold" ] == 0 } {
+			set hotcmd "TemperatureChange $Info(Station) thirty"
+			set roomcmd "TemperatureChange $Info(Station) recover"
+			set coldcmd "Cancel cold"
+		} elseif  { [ string compare [ string tolower $Info(Type) ] "hot" ] == 0 } {
+			set hotcmd "Cancel hot"
+			set roomcmd "TemperatureChange $Info(Station) recover"
+			set coldcmd "TemperatureChange $Info(Station) thirty"
+		}
+		
+		if { [ regexp {^b3flex} $Info(HOST) ]  || [ regexp {^b3j750} $Info(HOST) ] || [ regexp {^b3dts} $Info(HOST) ]} {
+			set map "$BinDir/etc_pic_$Info(Type)/warning.gif"
+		} else {
+			set map "$BinDir/etc_pic_$Info(Type)/warning_hot.gif"
+		}
+		
+	} else {
+		if { [ string compare [ string tolower $Info(LastTempType) ] "cold" ] == 0 } {
+			set hotcmd "TemperatureChange $Info(Station) thirty"
+			set roomcmd "TemperatureChange $Info(Station) recover"
+			set coldcmd "Cancel cold"
+		} elseif  { [ string compare [ string tolower $Info(LastTempType) ] "hot" ] == 0 } {
+			set hotcmd "Cancel hot"
+			set roomcmd "TemperatureChange $Info(Station) recover"
+			set coldcmd "TemperatureChange $Info(Station) thirty"
+		}
+		
+		if { [ regexp {^b3flex} $Info(HOST) ]  || [ regexp {^b3j750} $Info(HOST) ] || [ regexp {^b3dts} $Info(HOST) ]} {
+			set map "$BinDir/etc_pic_$Info(LastTempType)/warning.gif"
+		} else {
+			set map "$BinDir/etc_pic_$Info(LastTempType)/warning_hot.gif"
+		}
+	}
+	
+	set im [image create photo -file $map]
+	label .we.top.image -image $im
+	pack .we.top.image -side left -padx 5m -pady 5m
+	
+	if { [ regexp {^b3flex} $Info(HOST) ]  || [ regexp {^b3j750} $Info(HOST) ] || [ regexp {^b3dts} $Info(HOST) ]} {
+		button .we.bot.button -text Hot -command $hotcmd -fg red -font {times 15 bold}
+		pack .we.bot.button -side left -expand 1 \
+			-padx 5m -pady 5m -ipadx 2m -ipady 1m
+		button .we.bot.button1 -text Room -command $roomcmd -fg "dark green" -font {times 15 bold}
+		pack .we.bot.button1 -side left -expand 1 \
+			-padx 5m -pady 5m -ipadx 2m -ipady 1m
+		button .we.bot.button2 -text Cold -command $coldcmd -fg blue -font {times 15 bold}
+		pack .we.bot.button2 -side right -expand 1 \
+			-padx 5m -pady 5m -ipadx 2m -ipady 1m
+	} else {
+		if { $Info(AbortLot) == 0 } {
+			if { [ string compare [ string tolower $Info(Type) ] "cold" ] == 0 } {
+				button .we.bot.button2 -text Cold -command $coldcmd -fg blue -font {times 15 bold}
+				pack .we.bot.button2 -side right -expand 1 \
+					-padx 5m -pady 5m -ipadx 2m -ipady 1m
+				button .we.bot.button1 -text Room -command $roomcmd -fg "dark green" -font {times 15 bold}
+				pack .we.bot.button1 -side left -expand 1 \
+					-padx 5m -pady 5m -ipadx 2m -ipady 1m
+
+			} elseif  { [ string compare [ string tolower $Info(Type) ] "hot" ] == 0 } {
+				button .we.bot.button -text Hot -command $hotcmd -fg red -font {times 15 bold}
+				pack .we.bot.button -side left -expand 1 \
+					-padx 5m -pady 5m -ipadx 2m -ipady 1m
+				button .we.bot.button1 -text Room -command $roomcmd -fg "dark green" -font {times 15 bold}
+				pack .we.bot.button1 -side left -expand 1 \
+					-padx 5m -pady 5m -ipadx 2m -ipady 1m
+			}
+			
+		} else {
+			if { [ string compare [ string tolower $Info(LastTempType) ] "cold" ] == 0 } {
+				button .we.bot.button2 -text Cold -command $coldcmd -fg blue -font {times 15 bold}
+				pack .we.bot.button2 -side right -expand 1 \
+					-padx 5m -pady 5m -ipadx 2m -ipady 1m
+				button .we.bot.button1 -text Room -command $roomcmd -fg "dark green" -font {times 15 bold}
+				pack .we.bot.button1 -side left -expand 1 \
+					-padx 5m -pady 5m -ipadx 2m -ipady 1m
+			} elseif  { [ string compare [ string tolower $Info(LastTempType) ] "hot" ] == 0 } {
+				button .we.bot.button -text Hot -command $hotcmd -fg red  -font {times 15 bold}
+				pack .we.bot.button -side left -expand 1 \
+					-padx 5m -pady 5m -ipadx 2m -ipady 1m
+				button .we.bot.button1 -text Room -command $roomcmd -fg "dark green" -font {times 15 bold}
+				pack .we.bot.button1 -side left -expand 1 \
+					-padx 5m -pady 5m -ipadx 2m -ipady 1m
+			}
+		}
+	}
+
+	tkwait visibility .we.bot
+	focus -force .we.bot.button1
+	grab set -global .we.bot
+	WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "lotenddiag: .we.bot create complete and lock the screen now."
+	after 1000 RaiseWindow .we
+}
+######################################################
+# End of Lot to remind cool down
+######################################################
+
+proc EndOfLot {station} {
+
+	global lastlogfile ReadList SetupFlag
+	global Info BinDir LogDir Debug_Flag
+	global probertype  Flag4CPLE_First_Wafer_Chuck
+
+	# add by Jiang for load default hot part only once.
+	set Info(LoadDefault) 0
+	WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "EndOfLot: Lot End."
+	if { [ winfo exists .dlg1 ] } {
+		grab release .dlg1
+		destroy .dlg1
+	}
+	if { [ winfo exists .dlg2 ] } {
+		grab release .dlg2
+		destroy .dlg2
+	}
+
+	if { [ string compare $Info(Device) "NON" ] != 0 && [ string compare $Info(Device) "NON140" ] != 0 && [file exists $lastlogfile] == 0} {
+		if [ catch { open $lastlogfile w } fp] {
+		} else {
+			set time_flag_tmp [ eval exec "$BinDir/etc/sys_time -s" ]
+			WriteFile2 $lastlogfile $Info(Device)
+			WriteFile2 $lastlogfile $Info(LotID)
+			WriteFile2 $lastlogfile $Info(Sort)
+			WriteFile2 $lastlogfile $Info(Type)
+			WriteFile2 $lastlogfile $Info(PCID)
+			WriteFile2 $lastlogfile $Info(PBID)
+			WriteFile2 $lastlogfile $Info(Temperature)
+			WriteFile2 $lastlogfile $time_flag_tmp
+			WriteFile2 $lastlogfile $Info(RecoverTimer)
+			WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "EndOfLot: Write lastlog file done, the info is $Info(Device) $Info(LotID) $Info(Sort) $Info(Type) $Info(PCID) $Info(PBID) $Info(Temperature) $time_flag_tmp $Info(RecoverTimer)"
+		}
+		close $fp
+	}
+
+	if { $SetupFlag == 1 || $Info(AbortLot) == 1} {
+
+		#reminddiag
+		lotenddiag
+		
+	} else {
+		ResetAll 0
+		ResetAll 1
+		WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "EndOfLot: ResetAll completed."
+	}
+
+}
+
+proc evrcellstatus { station cellID label[] operatorID waferID state deviceType lotName totalWafers lastWafer runningYield waferYield[]} {
+ global Info SOW EOW AS env promisname SOL
+  
+	set Info(CellID) $cellID
+	set Info(Station) $station
+	set Info(Device) $deviceType
+	set Info(LotID) $lotName
+	set Info(OperID) $operatorID
+	set Info(State) $state
+	set Info(Event) "cellstatus"
+	set datestring [clock seconds]
+	set datestring [clock format $datestring -format %Y-%m-%dT%H:%M:%S]
+	
+	if {$Info(State) == "Wafer_end"} {
+		 set EOW 1	
+		 set Info(isReprobe) 0	 		 
+	 }	
+}
+
+proc evrprobecardevent { station tyPerfEvent npolish ntouch pcID pcType sites[]} {
+	global Info env promisname
+	set Info(NumPolish) $npolish
+	set Info(PcType) $pcType
+	set Info(PCID) $pcID
+	set Info(NTouch) $ntouch
+	
+}
+
+
+######################################################
+# Timer per second
+######################################################
+proc tick { option } {
+	global minutes seconds tempMinutes first_dts promisname lastlogfile
+	global Info Flag BinDir endoflot_flag LogDir env
+
+	if { $Flag == 1 } {
+		after 1000 "tick $option"
+		
+	}
+	if { $minutes >= 0 } {
+		set seconds [expr $seconds - 1]
+		
+		if { $seconds <= 0 } {
+			if { $minutes == 0 && $seconds == 0 } {
+				set Flag 0
+				
+				#################################
+				PutsDebug "send TAlarm to EMS start"
+				set comments "TAlarm"
+				set msg [Generate_EPR_Msg  "Unscheduled Down" "$promisname \"\" \"\" true" "" "ALARM_SET" "\"SUBSTATE Ualarm \" \"LOT_ID  $Info(LotID) \" \"DEVICE_ID $Info(Device)  \" \"REPROBE $Info(isReprobe)  \" \"COMMENTS $comments \" \"OPERATOR_ID $Info(OperID)  \" \"PROBECARD_ID $Info(PCID)  \" \"PROBECARD_TYPE $Info(PCType) \" \"WAFER_ID $Info(Wafer) \" \"PASS  $Info(Sort)\" " ""]
+				Msg_To_TTT $msg
+				
+				PutsDebug "send TAlarm to EMS complete"
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "tick,send TAlarm to EMS complete"
+				##################################
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "tick over!!"
+				destroy .clock
+				if { [ string compare $option "soak" ] == 0 } {
+					############update by fengsheng for add Login screen to popup alignment window#################
+					if { [ string compare [ string tolower $Info(AlignmentAlarm) ] "yes" ] == 0 } {
+						Login_Screen .align
+					} else {
+						set map "$BinDir/etc_pic_$Info(Type)/align.gif"
+						toplevel .align
+						wm title .align Align
+						wm iconname .align Dialog
+						frame .align.top -relief raised -bd 1
+						pack .align.top -side top -fill both
+						frame .align.bot -relief raised -bd 1
+						pack .align.bot -side bottom -fill both
+						set im [image create photo -file $map]
+						label .align.top.image -image $im
+						pack .align.top.image -side left -padx 5m -pady 5m
+						button .align.bot.button -text OK -command {
+												evr send start 0
+												destroy .align
+												}
+						pack .align.bot.button -side left -expand 1 \
+							-padx 5m -pady 5m -ipadx 2m -ipady 1m
+						tkwait visibility .align.bot
+						focus -force .align.bot.button
+						grab set -global .align.bot
+						after 1000 RaiseWindow .align
+					}
+				} elseif { [ string compare $option "recover" ] == 0 } {
+					SaveRecoverStatus $option "auto"
+					WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "tick,recover done"
+				} elseif { [ string compare $option "thirty" ] == 0 } {
+					SaveRecoverStatus $option "auto"
+					WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "tick,thirty done"
+				}
+				if { $endoflot_flag == 1 } {
+#	writelog
+#					WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "tick over"
+					ResetAll 1
+					ResetAll 0
+				}
+			}
+			set seconds 59
+			set minutes [expr $minutes - 1]
+			set tempMinutes $minutes
+		}
+		if { [ winfo exists .clock ] } {
+			.clock.l config -text [format "%d:%d" $tempMinutes $seconds]
+		}
+	}
+}
+
+proc wtick { station option } {
+	global w2w_minutes w2w_seconds w2w_tempMinutes  promisname
+	global Info wFlag BinDir  LogDir env
+
+	if { $wFlag == 1 } {
+		after 1000 "wtick $station $option"		
+	}
+	if { $w2w_minutes >= 0 } {
+		set w2w_seconds [expr $w2w_seconds - 1]
+		
+		if { $w2w_seconds <= 0 } {
+			if { $w2w_minutes == 0 && $w2w_seconds == 0 } {
+				set wFlag 0
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "tick over!!"
+				destroy .wclock
+				set Info(move_now) 0
+				set Info(STtime) [TIME_STAMPs]
+				evr send start $station
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "Wtick: WaferToWafer Bake over, send start"			
+			}
+			set w2w_seconds 59
+			set w2w_minutes [expr $w2w_minutes - 1]
+			set w2w_tempMinutes $w2w_minutes
+		}
+		if { [ winfo exists .wclock ] } {
+			.wclock.l config -text [format "%d:%d" $w2w_tempMinutes $w2w_seconds]
+		}
+	}
+}
+
+proc mtick {  } {
+	global Info m_minutes m_seconds LogDir InputTime start_minutes start_seconds promisname
+	if { $m_minutes >= 0 && $m_seconds >= 0 } {
+		set m_seconds [expr $m_seconds - 1]
+		if { $m_seconds <= 0 } {
+			puts "now minutes = $m_minutes,seconds = $m_seconds"
+			if { $m_minutes == 0 && $m_seconds == 0 } {
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "manual clock tick over! now shaking!"
+				#tick over and shaking the window
+				.mclock.l config -text "Over"
+				shaking .mclock
+				# change EMS status back to purple.
+				#PutsDebug "send MAlarm to EMS start"
+				set comments "AlarmByManualTimer"
+				set msg [Generate_EPR_Msg  "Unscheduled Down" "$promisname \"\" \"\" true" "" "ALARM_SET" "\"SUBSTATE Ualarm \" \"LOT_ID  $Info(LotID) \" \"DEVICE_ID $Info(Device)  \" \"REPROBE $Info(isReprobe)  \" \"COMMENTS $comments \" \"OPERATOR_ID $Info(OperID)  \" \"PROBECARD_ID $Info(PCID)  \" \"PROBECARD_TYPE $Info(PCType) \" \"WAFER_ID $Info(Wafer) \" \"PASS  $Info(Sort)\" " ""]
+				puts "msg is $msg"
+				if [ catch { Msg_To_TTT $msg } err] {
+					WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "TimerByHand: change EMS to purple error, error is $err"
+				} else {
+					WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "TimerByHand: change EMS to purple complete"
+				}
+				return
+			} else {
+				set m_seconds 59
+				set m_minutes [expr $m_minutes - 1]
+			}
+		} 
+		if { [ winfo exists .mclock ] } {
+			.mclock.l config -text [format "Start:%d:%d \nRemain: %d:%d" $start_minutes $start_seconds $m_minutes $m_seconds]
+		} else {
+			return
+		}
+		incr start_seconds
+		if {$start_seconds >= 60} {
+			set start_seconds 1
+			incr start_minutes
+		}
+		after 1000 "mtick"
+	}
+}
+
+proc shaking {window} {
+	global start_minutes start_seconds
+	incr start_seconds
+	if {$start_seconds >= 60} {
+		set start_seconds 1
+		incr start_minutes
+	}
+	set current [TIME_STAMPs]  
+	
+	if {[expr $current % 2]} {
+		set color red
+	} else {
+		set color green
+	}
+	if { [ winfo exists .mclock ] } {
+		.mclock.l config -bg $color
+		.mclock.l config -text "Start: $start_minutes:$start_seconds \nOver"
+		after 1000 "shaking $window"
+	} else {
+		return
+	}
+}
+
+######################################################
+#Loginscreen by fengsheng
+######################################################
+set verify_passwd_prog "/exec/apps/bin/ldap/ldap_auth_fsl"
+
+proc Login_Screen {screen} {
+
+	global Confirmed name password error_msg msg img leftspaces rightspaces
+	global S
+	global BinDir Probe Info LogDir
+	global before
+	global after
+
+
+	set img "$BinDir/etc_pic_$Info(Type)/align.gif"
+	set msg ""
+	set leftspaces ""
+	set rightspaces ""
+	set error_msg "Please enter your oneIT password!"
+	set password ""
+	set name ""
+	set before ""
+	set after ""
+	set arg_msg "Z Coordinates"
+	if [winfo exists $screen] {
+		return
+	}
+	set S $screen
+	wm withdraw .
+
+	toplevel $screen -class Dialog
+	wm geometry $screen "-1600-1200"
+	wm protocol $screen WM_DELETE_WINDOW { Exit }
+	wm title $screen "Align"
+	wm iconname $screen Dialog
+
+	frame $screen.row
+	set im [image create photo -file $img]
+	label $screen.row.l -image $im
+	pack  $screen.row.l -side left -padx 10 -pady 8
+
+	frame $screen.msg
+	message $screen.msg.1 -width 12i -anchor sw -text $msg \
+		-font -Adobe-Times-Medium-R-Normal-*-180-*
+	pack $screen.msg.1 -side left -expand yes -fill both -padx 10 -pady 8
+
+	frame $screen.row0
+	label $screen.row0.l -text "$leftspaces $arg_msg $rightspaces"
+	pack  $screen.row0.l -side left -padx 10 -pady 8
+
+	frame $screen.row1
+	label $screen.row1.l -text "Before alignment:"
+	entry $screen.row1.e -textvariable before -width 15
+	label $screen.row1.r -text "$rightspaces"
+	pack  $screen.row1.l $screen.row1.e $screen.row1.r -side left  -padx 6 -pady 4
+
+	frame $screen.row2
+	label $screen.row2.l -text " After alignment:" -anchor e
+	entry $screen.row2.e -textvariable after -width 15
+	label $screen.row2.r -text "$rightspaces"
+	pack  $screen.row2.l $screen.row2.e $screen.row2.r -side left  -padx 6 -pady 4
+
+	frame $screen.row3
+	label $screen.row3.l -text "$leftspaces $error_msg $rightspaces"
+	pack  $screen.row3.l -side left -padx 10 -pady 8
+
+	frame $screen.row4
+	label $screen.row4.l -text "$leftspaces           Login:" -anchor e
+	entry $screen.row4.e -textvariable name -width 15
+	label $screen.row4.r -text "$rightspaces"
+	pack  $screen.row4.l $screen.row4.e $screen.row4.r -side left  -padx 6 -pady 4
+
+	frame $screen.row5
+	label $screen.row5.l -text "$leftspaces        Password:" -anchor e
+	entry $screen.row5.e -textvariable password -width 15 -show *
+	label $screen.row5.r -text "$rightspaces"
+	pack  $screen.row5.l $screen.row5.e $screen.row5.r -side left -padx 6 -pady 4
+
+	frame  $screen.row6
+	label  $screen.row6.l -text "$leftspaces               "
+	button $screen.row6.b2 -text "OK" -command {
+		if { [string compare $after ""] == 0 || [string compare $before ""] == 0 } {
+			tk_dialog .warning "Alignment input check" "Please verify the inputting" warning 0 "OK"
+			return
+		} else {
+			if {![regexp {(^[0-9]+)$} $before] || ![regexp {(^[0-9]+)$} $after]} {
+				tk_dialog .warning "Alignment input check" "Please input numbers from \[0-9\]" warning 0 "OK"
+				return
+			} else {
+				if { [string length [string trim $before]] != 5 || [string length [string trim $after]] != 5 } {
+					tk_dialog .warning "Alignment input check" "Please input 5 numbers" warning 0 "OK"
+					return
+				} else {
+					set Interval [ expr { $before - $after } ]
+					if { $Info(AlignmentLimit) == "" } {
+						set Info(AlignmentLimit) 0
+						if { $Interval <= $Info(AlignmentLimit) } {
+							#Please check if the Z Coordinates are correct !\n  If no problem please contact Process!
+							#(Before alignment - After alignment) should > $Info(AlignmentLimit)(variable)
+							tk_dialog .warning "Alignment input check dialog window" "Check if the Z Coordinates are correct!\n If no problem please contact Process!\n (Before alignment - After alignment) should >$Info(AlignmentLimit)(variable)" "" 0 "OK"
+							return
+						}
+					} elseif { $Interval <= $Info(AlignmentLimit) } {
+						set Text "Check if Z Coordinates are correct!\nIf no problem please contact Process!\n(Before alignment - After alignment) should >$Info(AlignmentLimit)(variable)"
+						tk_dialog .warning "Alignment input check" "Check if Z Coordinates are correct!\nIf no problem please call Process!\n\n\n(Before alignment-After alignment) Should > $Info(AlignmentLimit)" "" 0 "OK"
+						return
+					}
+				}
+			}
+		}
+		Show_Result $S
+	}
+	pack  $screen.row6.b2 $screen.row6.l  -expand yes -fill both -padx 5 -pady 8
+
+	focus -force $screen.row1.e
+	bind $screen.row4.e <Return> \
+		{
+		focus $S.row5.e
+		}
+
+	bind $screen.row5.e <Return> \
+		{
+		$S.row6.b2 configure -state active
+		focus $S.row6.b2
+		}
+
+	pack $screen.row $screen.msg $screen.row0 $screen.row1 $screen.row2 $screen.row3 $screen.row4 $screen.row5 $screen.row6 -side top
+	tkwait visibility $screen.row6
+	grab set -global $screen
+	WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "Login_Screen: $screen create finish, lock screen now"
+	
+	RaiseWindow $screen
+#	raise $screen
+}
+
+proc Show_Result {screen} {
+	global before after name password error_msg Confirmed verify_passwd_prog Info BinDir LogDir
+	set d_time [eval exec "$BinDir/etc/sys_time -t" ]
+	set name [ string tolower $name ]
+	set before $before
+	set after $after
+	if { [string last $name "r42141"] == 0 || [string last $name "R42141"] == 0 } {
+		set error_msg " Invalid login name! "
+		Reset $screen
+	} else {
+		set auth_cmd "$verify_passwd_prog $name $password"
+		if { [catch {eval exec $auth_cmd} err] } {
+			set error_msg " Invalid login or password!  "
+			Reset $screen
+		} else {
+			set result [eval exec $auth_cmd]
+			if { [string compare $result "successful"] == 0  || \
+				[string compare $result "0:Success"] == 0   || \
+				[string compare $result "200:Valid Login"] == 0        } {
+				if { [winfo exists $screen] != 0 } {
+					destroy $screen
+				}
+				set Confirmed $name
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "Show_Result: Align login:$Info(Device),$Info(LotID),$Info(WaferID),$Info(Sort),$Info(PCID),$Confirmed,$d_time,Before alignment:$before,After alignment:$after"
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "Show_Result: $name Login sucessful, send start"
+				evr send start 0
+			} else {
+				set error_msg " Invalid login or password!  "
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "Show_Result: $name Login failed, reset $screen"
+				Reset $screen
+			}
+		}
+	}
+}
+
+proc Reset { screen } {
+	global name password Confirmed
+	set Confirmed failed
+	set name ""
+	set password ""
+	if { [winfo exists $screen] != 0 } {
+		grab release $screen
+		destroy $screen
+	}
+	Login_Screen .align
+}
+
+proc Exit {} {
+	global Host Part Lot Pass msg Confirmed
+	exit
+}
+
+######Loginscreen end################################
+
+######################################################
+# Stop timer
+######################################################
+proc Cancel { option } {
+	global minutes seconds tempMinutes first_dts Flag pauseDlg .dlg3
+	global Probe LogDir Info BinDir Debug_Flag Clock_Info endoflot_flag
+
+	if [winfo exists .clock] {
+		grab release .clock
+	} elseif [ winfo exists .we ] {
+		grab release .we
+		destroy .we
+	}
+
+	WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "Cancel: trigger Cancel $option, Current Type $Info(Type)"
+	
+	set d_time [eval exec "$BinDir/etc/sys_time -t" ]
+
+	if [catch { set USER_AUTH [eval exec "$BinDir/etc/login_screen"] } err ] {
+		WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "Cancel: error exec $BinDir/etc/login_screen, error code: $err "
+		return 0
+	} else {
+		while { [string last "fail" $USER_AUTH] >= 0 } {
+			WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "Cancel: user login fail"
+			set USER_AUTH [eval exec "$BinDir/etc/login_screen" ]
+		}
+	}
+
+	WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "Cancel: $USER_AUTH,login pass, continue cancel."
+	PutsDebug "Cancel: $USER_AUTH,login pass, continue cancel."
+	if { [ string compare $option "soak" ] == 0 } {
+		set context "$d_time, $Info(Device), $Info(LotID), $Info(Sort), $USER_AUTH, $Info(SoakTimer), $minutes, $seconds"
+	} elseif { [ string compare $option "recover" ] == 0 || [ string compare $option "thirty" ] == 0} {
+		set context "$d_time, $Info(Device), $Info(LotID), $Info(Sort), $USER_AUTH, $Info(RecoverTimer), $minutes, $seconds"
+		SaveRecoverStatus $option "manual"
+		WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "Cancel,$option done by manual cancel."
+	} else {
+		set context "$d_time, $Info(Device), $Info(LotID), $Info(Sort), $USER_AUTH, $Info(RecoverTimer), $minutes, $seconds"
+		WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "Cancel,lot end, choose $option."
+	}
+	
+	if [ winfo exists .dlg3 ] {
+		grab release .dlg3
+		destroy .dlg3
+		WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "Cancel: destroy die2die window done, Cancel complete."
+		PutsDebug "Cancel: destroy die2die window done, Cancel complete."
+	}
+
+	set Flag 0
+	destroy .clock
+	WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "Cancel: destroy .clock done, cancel complete. $context"
+	
+	if { $endoflot_flag == 1 } {
+		ResetAll 0
+		ResetAll 1
+	}
+}
+
+######################################################
+# write recover log
+######################################################
+proc SaveRecoverStatus { option recovertype } {
+	global recoverdonefile
+	global BinDir LogDir Info
+	
+	if { [file exists $recoverdonefile] == 1 } {
+		set cmd "rm $recoverdonefile"
+		catch { eval exec $cmd }
+	}
+	if { [ catch { open $recoverdonefile w } fp] } {
+	} else {
+		WriteFile2 $recoverdonefile $option
+		WriteFile2 $recoverdonefile $recovertype 
+	}
+	close $fp
+	WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "SaveRecoverStatus, $option done by $recovertype."
+}
+
+######################################################
+# Write logs
+######################################################
+proc WriteFile { filename text } {
+	set time_stamp [TIME_STAMPt]
+	set fp [open $filename "a+"]
+	puts $fp "$text <= record at $time_stamp"
+	close $fp
+}
+
+proc WriteFile2 { filename text } {
+#	set time_stamp [TIME_STAMPt]
+	set fp [open $filename "a+"]
+	puts $fp $text
+	close $fp
+}
+
+######################################################
+# Read last log infomation
+######################################################
+proc ReadFile { filename type} {
+
+	global ReadList {}
+	global BinDir LogDir Info
+
+	set currentdate [ eval exec "$BinDir/etc/sys_time -s" ]
+	set ReadList {}
+	if [catch {open $filename r} fileID]  {
+		WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "ReadFile: Cannot open file $filename."
+	} else {
+		foreach line [ split [ read $fileID] \n ] {
+			lappend ReadList $line
+		}
+		close $fileID
+		WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "ReadFile: $type info: $ReadList."
+	}
+
+	if { ! [ info exists ReadList] } {
+		if { [ string compare $type "last" ] == 0} {
+			set ReadList [ list N/A N/A N/A room N/A N/A 1 "$currentdate" 0 ]
+		} elseif { [ string compare $type "recover" ] == 0 } {
+			set ReadList [ list N/A N/A ]
+		}
+	}
+}
+
+######################################################
+# Reset
+######################################################
+proc ResetAll {station} {
+
+	global minutes seconds tempMinutes CPLE_First_Wafer_Time_End CPLE_First_Wafer_Time_Start Flag4CPLE_First_Wafer_Chuck
+	global Probe LogDir Info BinDir Debug_Flag Clock_Info CPLE_Class
+	global Flag SetupFlag FirstWafer special_flag first_dts endoflot_flag opset promisname
+
+	set Info(Device) N/A
+	set Info(LotID) N/A
+	set Info(Sort) N/A
+	if { [ string compare $Info(Device) "NON" ] != 0 && [ string compare $Info(Device) "NON140" ] != 0  } {
+		set Info(Type) room
+	}
+	
+	set Info(Temperature) 0
+	set Info(PCID) N/A
+	set Info(PBID) N/A
+	set minutes 0
+	set tempMinutes 0
+	set seconds 0
+	set Flag 0
+	set opset 0
+	set SetupFlag 0
+	set special_flag 0
+	set first_dts 0
+	set endoflot_flag 0
+	set FirstWafer 0
+	#set load_sim "N/A"
+	set Info(J971) N/A
+	set Info(TOALing) 0
+	set Info(F_Step) 0
+	set Info(WaferCount) 0
+	set Info(WaferID) 1-0
+	set Info(MonitorHWafer) ""
+	set Info(PCType) 0
+	set Info(isReprobe) 0
+	set Info(AlarmTime) 0
+	set Info(LastEventTime) [clock seconds]
+	set Info(die2die) "Auto"
+	set Info(d2d_flag) 0
+	set Info(NoBake) 0
+	set Info(ShortBake) 1800
+	set Info(AlignmentAlarm) ""
+	set Info(AlignmentLimit) 0
+	set Info(flag_ShortTerm) 0
+	set Info(OperID) NULL
+	set Info(Wafer) 0
+	
+	for { set i 0 } { $i < 26 } { incr i } {
+		set Info(ThanSixH_${i}) 0
+	}
+
+	#####for debug####
+	set Info(HOT_flag) 0
+	set Info(STtime) 0
+	set Info(ENtime) 0
+	set Info(TGap) 0
+	set Info(failure) start
+	set Info(Cancel) 0
+	set Info(D2D_IntervalMax) 0
+#$Info(D2D_IntervalMax) < $Info(D2D_IntervalMin)
+	set Info(D2D_IntervalMin) 0
+	set Info(D2D_SoakMin) 0
+	
+	set Info(DefaultPass) 0
+	set Info(D2D_SoakMax) 0
+	set Info(PauseSoak) 0
+	set Info(Center) ""
+	set Info(move_now) 0
+	set Info(Die2DieSoak) 0
+	set Info(TestComWfrID) na
+#	set Info(StopAtInitialDie) no
+	set Flag4CPLE_First_Wafer_Chuck 0
+	set CPLE_First_Wafer_Time_Start 0
+	set CPLE_First_Wafer_Time_End 0
+	set CPLE_Class 0
+	set Info(CPLEClass) "no"
+	set Info(SAFDE) "yes"
+#	reset log flag 4 getsetup proc
+	set Info(WriteLog4GetSeup) 0
+	set Info(WriteLog4GetWaferCenter) 0
+	set Info(WriteLog4SetDefault) 0
+	# add by Jiang for load default hot part only once.
+	set Info(LoadDefault) 0
+	set Info(isDefaultConfig) 0
+	catch { unset ReadList }
+	# add by YN to show whether abort lot at lot start
+	set Info(AbortLot) 0
+	
+	WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "ResetAll: Resetting $station complete."
+}
+
+###############################################################
+#                                                             #
+# create abort dialog     -- not used                         #
+#                                                             #
+###############################################################
+proc genabortlotfunc {title text xbmfile station} {
+	global Info LogDir
+
+	evr send pause $station
+
+	set answer [ tk_dialog .abortlotfunc $title $text $xbmfile      0  "  Click to ABORT LOT " ]
+
+	if { $answer == 0 } {
+		evr send abortlot -discard $station
+		WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "genabortlotfunc: abort lot."
+		evr send start $station
+	}
+
+}
+
+proc showabortlot {title option station} {
+	global Info LogDir BinDir station_num
+	set station_num $station
+
+	evr send pause $station_num
+	if { [ string compare $option "recover" ] == 0 } {
+		set map "$BinDir/etc_pic_$Info(LastTempType)/FailedRecover.gif" 
+	} elseif { [ string compare $option "thirty" ] == 0 } {
+		set map "$BinDir/etc_pic_$Info(LastTempType)/FailedThirty.gif" 
+	} elseif { [ string compare $option "SAFD" ] == 0 } {
+		set map "$BinDir/etc_pic_$Info(Type)/FailedSAFD.gif" 
+	} elseif { [ string compare $option "System" ] == 0 } {
+		set map "$BinDir/etc_pic_$Info(Type)/FailedSystem.gif" 
+	} elseif { [ string compare $option "D2D" ] == 0 } {
+		set map "$BinDir/etc_pic_$Info(Type)/FailedD2D.gif" 
+	} elseif { [ string compare $option "Center" ] == 0 } {
+		set map "$BinDir/etc_pic_$Info(Type)/FailedCenter.gif" 
+	}
+	WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "showabortlot: abort lot window shown by $option"
+
+	toplevel .abortloterror
+	wm title .abortloterror $title
+	wm iconname .abortloterror Dialog
+	frame .abortloterror.top -relief raised -bd 1
+	pack .abortloterror.top -side top -fill both
+	frame .abortloterror.bot -relief raised -bd 1
+	pack .abortloterror.bot -side bottom -fill both
+	set im [image create photo -file $map]
+	label .abortloterror.top.image -image $im
+	pack .abortloterror.top.image -side left -padx 5m -pady 5m
+	button .abortloterror.bot.button -text "Click to ABORT LOT" -command {
+				grab release .abortloterror
+				destroy .abortloterror
+				evr send abortlot -discard $station_num
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "showabortlot: abort lot -- OK."
+				evr send start $station_num
+							}
+	pack .abortloterror.bot.button -side left -expand 1 \
+		-padx 5m -pady 5m -ipadx 2m -ipady 1m
+	tkwait visibility .abortloterror.bot
+	focus -force .abortloterror.bot.button
+	grab set -global .abortloterror.bot
+	if { [ string compare $option "recover" ] == 0 || [ string compare $option "thirty" ] == 0 } {
+		after 1000 RaiseWindow .abortloterror
+	}
+}
+
+
+proc PutsDebug {context} {
+	global Debug_Flag
+	if [ catch { set time [ clock format [ clock seconds ] -format "%Y/%m/%d %H:%M:%S" ] } ] {
+		set time N/A
+	}
+	if [ file exists $Debug_Flag ] {
+		puts "$context -- $time"
+	}
+}
+
+proc TimerByHand {} {
+	global Info m_minutes m_seconds  BinDir LogDir promisname InputTime start_minutes start_seconds
+	
+	set InputTime [Dialog_Prompt "Please enter the Timer you want!!"]
+	puts $InputTime
+	if {[winfo exists .mclock]} {
+		raise .mclock
+		puts "raise .mclock"
+	} else {
+		if { ! [string is integer $InputTime] || $InputTime == "" } {	
+			tk_dialog .warning "Timer input check" "Please input right numbers" warning 0 "OK"
+			TimerByHand
+		} elseif { $InputTime >= 60 } {
+			tk_dialog .warning "Timer input check" "Input Time Over Limit" warning 0 "OK"
+			TimerByHand
+		} else {
+			set m_seconds 0
+			set m_minutes $InputTime
+			if { [ winfo exist .mclock]} {
+				destroy .mclock
+			}
+			toplevel .mclock
+			wm overrideredirect .mclock true
+			set sizes [wm maxsize .mclock]
+			set x [expr {[lindex $sizes 0]/2 - 275}]
+			set y [expr {[lindex $sizes 1]/2 - 170}]
+			wm geometry .mclock "600x480+${x}+${y}"
+			label .mclock.l -height 2 -bg green -fg black -bd 10 -relief raised -font {times 50 bold} -text "Init"
+			set map "$BinDir/etc_pic_$Info(Type)/cancel.gif"
+			set im [image create photo -file $map]
+			button .mclock.stop  -command {DestroyWindow .mclock} -bg red -bd 5 -font {times 50 bold} -text "STOP"
+			pack .mclock.l -expand yes -fill both
+			pack .mclock.stop -expand yes -fill both
+			tkwait visibility .mclock
+			focus -force  .mclock
+			#grab set -global .mclock
+			#set stamp [TIME_STAMPf]
+			WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "Trigger: Manually Timer $InputTime minutes .mclock create complete and lock the screen now. "
+			after 1000 RaiseWindow .mclock
+			# change EMS status to green
+			set comments "ManualTimerStart"
+			
+			set msg [Generate_EPR_Msg  "Productive" "$promisname \"\" \"\" true" "" "EQUIP_START" "\"SUBSTATE Running \" \"LOT_ID  $Info(LotID) \" \"DEVICE_ID $Info(Device)  \" \"REPROBE $Info(isReprobe)  \" \"COMMENTS $comments \" \"OPERATOR_ID $Info(OperID)  \" \"PROBECARD_ID $Info(PCID)  \" \"PROBECARD_TYPE $Info(PCType) \" \"WAFER_ID $Info(Wafer) \" \"PASS  $Info(Sort)\" " " \"ALARM_TIME 0 \" "]
+			puts "msg is $msg"
+			if [catch { Msg_To_TTT $msg } err] {
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "TimerByHand: change EMS to green error, error is $err"
+			} else {
+				WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "TimerByHand: change EMS to green complete"
+			}
+			
+			# send end
+			set start_minutes 0
+			set start_seconds 0
+			mtick 
+		}
+	}
+	
+}
+
+proc DestroyWindow {window} {
+	global LogDir Info
+	#set stamp [TIME_STAMPf]
+	WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "DestroyWindow $window "
+	destroy $window
+}
+
+proc Dialog_Create { top title args} {
+	global dialog
+	if [ winfo exists $top ] {
+		switch -- [wm state $top] {
+			normal {
+				raise $top
+			}
+			withdrawn -
+			iconic {
+				wm deiconify $top
+				catch {wm geometry $top $dialog(geo,$top)}
+			}
+		}
+		return 0
+	} else {
+		eval {toplevel $top} $args
+		wm title $top $title
+		return 1
+	}
+}
+
+proc Dialog_Prompt { str } {
+	global prompt BinDir Info
+	
+	set prompt(result) ""
+	
+	set f .tempinput
+	if {[winfo exists .mclock]} {
+		raise .mclock
+		return
+	}
+	if [Dialog_Create $f "Enter Timer" -borderwidth 10 ] {
+		message $f.msg -text $str -aspect 1000
+		entry $f.entry -textvariable prompt(result)
+		set b [frame $f.buttons]
+		
+		set map "$BinDir/etc_pic_$Info(Type)/man_hc.gif"
+		set im [image create photo -file $map]
+		label $f.image -image $im
+		
+		pack $f.image $f.msg $f.entry $f.buttons -side top -fill x
+		pack $f.entry -padx 5
+		button $b.ok -text OK -command { set prompt(ok) 1 }
+		button $b.cancel -text Cancel -command { destroy .tempinput}
+		pack $b.ok -side left
+		pack $b.cancel -side right
+		bind $f.entry <Return> {set prompt(ok) 1 ; break}
+		bind $f.entry <Control-c> {set prompt(ok) 0 ; break }
+		
+		wm protocol $f WM_DELETE_WINDOW { destroy $f }
+		wm title $f "Enter Prober Temperature"
+		wm protocol $f WM_DELETE_WINDOW "Dialog_Prompt \"$str\" "
+		wm geometry $f "600x280+0+0"
+		
+	}
+	set prompt(ok) 0
+#	Dialog_Wait $f prompt(ok) $f.entry
+	vwait prompt(ok)
+	if {$prompt(ok)} {
+		destroy .tempinput
+		return $prompt(result)
+	} else {
+		destroy .tempinput
+		Dialog_Prompt $str
+		return {}
+	}
+}
+
+###############################################################
+#
+# Main program
+#
+###############################################################
+
+global minutes seconds tempMinutes	promisname
+global Probe LogDir Info BinDir Debug_Flag Clock_Info SetupFlag
+global Flag temperaturechange_flag
+global first_dts Stationnum CPLE_Class
+#CPLE_Class was replaced by Info(CPLEClass)
+global probertype special_flag endoflot_flag CPLE_First_Wafer_Time_Start CPLE_First_Wafer_Time_End Flag4CPLE_First_Wafer_Chuck
+
+# $CPLE_First_Wafer_Time_Start & CPLE_First_Wafer_Time_End & Flag4CPLE_First_Wafer_Chuck were abandoned because the '1st wafer issue' was solved by auto-corr function
+
+set Info(HOST) [ eval exec "hostname" ]
+set Info(Station) 0
+
+set Probe "/exec/apps/bin/evr"
+set BinDir "$Probe/clock"
+set LogDir "/data/probe_logs"
+#set lastlogfile "/var/tmp/lastlot.log"
+set lastlogfile "$BinDir/ProductionLog/LastLot/$Info(HOST).log"
+set recoverdonefile "$BinDir/ProductionLog/RecoverDone/$Info(HOST).done"
+
+set Debug_Flag "/tmp/clock_debug_on"
+PutsDebug "setting Info(HOST) = $Info(HOST)"
+set TTT_EVRDir "/exec/apps/bin/evr/TTT"
+#temp change:
+#set Clock_Info "$BinDir/clock_setup4cple.txt"
+#temp chagne done;
+#set Clock_Info "$BinDir/ClockSetup.txt"
+set Clock_Info "$BinDir/clock_setup.txt"
+
+#set SOAK_Info "$BinDir/TOAL_exclude.txt"
+set scfcmount [get_env SCFCMOUNT]
+set probertype [get_env SCPROBER]
+WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "Setting ProberType as $probertype from environment variable"
+set Info(move_now) 0
+
+set first_dts 0
+#set load_sim "N/A"
+#set load_err "N/A"
+set Info(RecoverTimer) 0
+set Info(SoakTimer) 0
+set Info(Type) room
+set temperaturechange_flag 3
+set SetupFlag 0
+set special_flag 3
+set Stationnum 0
+set endoflot_flag 0
+
+# for auto-corr 1-66
+set Info(ThanSixH_66) 0
+
+# connect to control loop; register callback procedures
+# standardize the evr binding proc names by JiangNan 20150625
+evr connect localhost
+evr bind startoflot StartOfLot
+evr bind startofsession StartOfSession
+evr bind movecursor MoveCursor
+evr bind testresults TestResults
+evr bind endofwafer EndOfWafer
+evr bind setupname SetupName
+evr bind setupinfo SetupInfo
+evr bind infomessage InfoMessage
+evr bind errormessage ErrMsg
+evr bind statusmessage StatusMsg
+evr bind waferinfo WaferInfo
+evr bind layoutheader LayoutHeader
+evr bind probecarddefine ProbeCardDefine
+evr bind startofwafer StartOfWafer
+evr bind endoflot EndOfLot
+evr bind cellstatus evrcellstatus
+evr bind probecardevent evrprobecardevent
+
+set Info(Uname) [ eval exec "uname" ]
+set Info(UnameR) [ eval exec "uname -r" ]
+set SUNOS "SunOS"
+
+set d_time [TIME_STAMPt]
+if [file exists $Debug_Flag] {
+	WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "Start of HOT EVR at $d_time"
+}
+
+if [catch {source $TTT_EVRDir/Generate_EPR_Msg.tcl} result] {
+	PutsDebug  "Failed to generate the EPR++ Message: $result."
+	WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "Failed to generate the EPR++ Message: $result."
+	exit
+} 
+
+if [catch {source $TTT_EVRDir/Msg_To_TTT.tcl} result] {
+	PutsDebug "Failed to send the EPR++ Message to TTT: $result."
+	WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "Failed to send the EPR++ Message: $result."
+	exit
+}
+
+set promisname None
+set Retry_Times 0
+ResetAll 0
+ResetAll 1
+if [ info exists env(PROMIS_NAME) ] {
+    set promisname $env(PROMIS_NAME)
+} else {
+	if { [catch {set promisname [exec hostname]} err] } {
+		WriteFile "$LogDir/clock/clock.out.$Info(HOST)" "Main program: ERROR when set promisname : $err"
+	} 
+}
+
+#
+# Create Startup Message
+#
+
+wm overrideredirect . true
+set sizes [wm maxsize .]
+set x [expr {[lindex $sizes 0]/2 - 275}]
+set y [expr {[lindex $sizes 1]/2 - 170}]
+wm geometry . "600x480+${x}+${y}"
+label .l -bg green -fg black -bd 10 -relief raised -text " TJNPRB Clock Monitor \n (c) 2001 - 2007 Freescale Inc"
+pack .l -expand yes -fill both
+
+after 4000 {
+	destroy .l
+	wm withdraw .
+	wm geometry . {}
+
+	toplevel .buttonMenu
+	wm overrideredirect .buttonMenu true
+
+	label .buttonMenu.l1 -bg #9478FF -fg white -text "TJNPRB Clock Monitor \n\n version 2.2.0"
+	pack .buttonMenu.l1 -expand yes -fill both
+	button .buttonMenu.pmi -bg green -fg black -text " Hot Chuck EVR Monitoring "
+	pack .buttonMenu.pmi -side top -expand yes -fill both
+	button .buttonMenu.mtick -bg green -fg black -text " Hand Timer " -command "TimerByHand"
+	pack .buttonMenu.mtick -side top -expand yes -fill both
+	
+	wm geometry .buttonMenu "-0+30"
+	wm deiconify .buttonMenu
+}

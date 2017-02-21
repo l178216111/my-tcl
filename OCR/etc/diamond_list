@@ -1,0 +1,26 @@
+#!/bin/sh
+
+
+ARCH=`/bin/uname -s`
+
+if [ "$ARCH" = "SunOS" ] ; then
+    VER=`/bin/uname -r | cut -c1`
+    ARCH=${ARCH}${VER}
+fi
+
+script=`basename $0`
+
+case $ARCH in
+    SunOS4 )
+        rsh -l navOp lingyin /exec/apps/bin/evr/OCR/etc/$script.pl $1 $2
+        ;;
+    SunOS5 )
+        rsh -l navOp lingyin /exec/apps/bin/evr/OCR/etc/$script.pl $1 $2
+        ;;
+    HP-UX )
+        remsh lingyin -l navOp /exec/apps/bin/evr/OCR/etc/$script.pl $1 $2
+        ;;
+    Linux )
+        rsh -l navOp lingyin /exec/apps/bin/evr/OCR/etc/$script.pl $1 $2
+        ;;
+esac

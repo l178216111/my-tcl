@@ -1,0 +1,6 @@
+#!/bin/sh
+# SCCSID: @(#)/probe/users/probe/src/HOT_soak.EVR/SCCS/s.getVal.sh
+# Version: 1.1
+# Date: 08/07/01 07:52:49
+
+cat $1 | tr '\\' '\012' | grep  $2 | sed 's/.*://'
